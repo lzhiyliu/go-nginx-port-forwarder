@@ -1,0 +1,6 @@
+{
+  "name": "Nginx Port Forwarder",
+  "description": "A visual administration console for Nginx port forwarding rules, configuration previews, audit logs, and hot-reload controls.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

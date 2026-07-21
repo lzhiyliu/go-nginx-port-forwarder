@@ -1,0 +1,66 @@
+[
+  {
+    "id": "r1",
+    "name": "应用后端 API 转发",
+    "listenPort": 8080,
+    "targetHost": "192.168.1.100",
+    "targetPort": 8080,
+    "protocol": "HTTP",
+    "enabled": true,
+    "description": "开发环境主要的 API 服务网关转发，支持热重载，超时保持 10 分钟",
+    "createdAt": "2026-07-18T06:45:11.556Z",
+    "updatedAt": "2026-07-21T06:53:53.964Z",
+    "allowedIps": "",
+    "urlSuffix": "/test"
+  },
+  {
+    "id": "r2",
+    "name": "MySQL 数据库主库转发",
+    "listenPort": 3307,
+    "targetHost": "10.0.0.12",
+    "targetPort": 3306,
+    "protocol": "TCP",
+    "enabled": true,
+    "description": "云端 RDS 数据库本地端口映射，用于开发机直连调试",
+    "createdAt": "2026-07-19T06:45:11.557Z",
+    "updatedAt": "2026-07-19T06:45:11.557Z"
+  },
+  {
+    "id": "r3",
+    "name": "Redis 缓存层集群入口",
+    "listenPort": 6380,
+    "targetHost": "10.0.0.15",
+    "targetPort": 6379,
+    "protocol": "TCP",
+    "enabled": false,
+    "description": "Redis 哨兵模式入口，临时关闭，待扩容完成重新打开",
+    "createdAt": "2026-07-20T06:45:11.557Z",
+    "updatedAt": "2026-07-20T18:45:11.557Z"
+  },
+  {
+    "id": "r4",
+    "name": "MQTT 物联网协议转发",
+    "listenPort": 1884,
+    "targetHost": "192.168.5.20",
+    "targetPort": 1883,
+    "protocol": "UDP",
+    "enabled": true,
+    "description": "边缘网关采集通道，使用 UDP 保持高并发低延迟",
+    "createdAt": "2026-07-21T06:45:11.557Z",
+    "updatedAt": "2026-07-21T06:45:11.557Z"
+  },
+  {
+    "id": "rule_1784621512936",
+    "name": "1",
+    "listenPort": 8081,
+    "targetHost": "127.0.0.1",
+    "targetPort": 8021,
+    "protocol": "HTTP",
+    "enabled": true,
+    "description": "",
+    "allowedIps": "",
+    "urlSuffix": "",
+    "createdAt": "2026-07-21T08:11:52.936Z",
+    "updatedAt": "2026-07-21T08:11:52.936Z"
+  }
+]
