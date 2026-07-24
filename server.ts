@@ -4,7 +4,7 @@ import fs from "fs";
 import net from "net";
 import { exec } from "child_process";
 import { createServer as createViteServer } from "vite";
-import { ForwardRule, AppSettings, ConfigVersion, SystemStatus } from "./src/types";
+import { ForwardRule, AppSettings, ConfigVersion, SystemStatus, WhitelistGroup } from "./src/types";
 import { WebSocketServer, WebSocket } from "ws";
 
 const app = express();
@@ -30,6 +30,7 @@ const DATA_DIR = path.join(process.cwd(), "data");
 const RULES_FILE = path.join(DATA_DIR, "rules.json");
 const SETTINGS_FILE = path.join(DATA_DIR, "settings.json");
 const VERSIONS_FILE = path.join(DATA_DIR, "versions.json");
+const WHITELIST_GROUPS_FILE = path.join(DATA_DIR, "whitelist-groups.json");
 
 // Ensure data directory exists
 if (!fs.existsSync(DATA_DIR)) {
@@ -93,6 +94,25 @@ const defaultSettings: AppSettings = {
   domain: ""
 };
 
+const defaultWhitelistGroups: WhitelistGroup[] = [
+  {
+    id: "wg1",
+    name: "运维团队办公室",
+    description: "公司总部运维团队办公网段",
+    ips: "113.89.32.229\n113.89.33.249",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  },
+  {
+    id: "wg2",
+    name: "云服务器出口",
+    description: "云端服务器公网出口 IP",
+    ips: "43.162.112.236",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  },
+];
+
 const clients = new Set<WebSocket>();
 
 export const broadcastWS = (type: string, payload: any) => {
@@ -126,6 +146,7 @@ const readJsonFile = <T>(filePath: string, defaultVal: T): T => {
 let rules = readJsonFile<ForwardRule[]>(RULES_FILE, defaultRules);
 let settings = readJsonFile<AppSettings>(SETTINGS_FILE, defaultSettings);
 let versions = readJsonFile<ConfigVersion[]>(VERSIONS_FILE, []);
+let whitelistGroups = readJsonFile<WhitelistGroup[]>(WHITELIST_GROUPS_FILE, defaultWhitelistGroups);
 
 // Real-time shell executor
 const executeDiagnosticCommand = (cmd: string): Promise<string> => {
@@ -319,6 +340,88 @@ app.post("/api/settings", (req, res) => {
   res.json({ success: true, settings });
 });
 
+// ===== Whitelist Groups CRUD =====
+// GET all whitelist groups
+app.get("/api/whitelist-groups", (_req, res) => {
+  res.json(whitelistGroups);
+});
+
+// POST create whitelist group
+app.post("/api/whitelist-groups", (req, res) => {
+  const { name, description, ips } = req.body;
+  if (!name || !name.trim()) {
+    return res.status(400).json({ error: "组名称不能为空" });
+  }
+
+  const newGroup: WhitelistGroup = {
+    id: `wg_${Date.now()}`,
+    name: name.trim(),
+    description: (description || "").trim(),
+    ips: (ips || "").trim(),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  whitelistGroups.push(newGroup);
+  writeJsonFile(WHITELIST_GROUPS_FILE, whitelistGroups);
+  res.status(201).json({ success: true, group: newGroup });
+});
+
+// PUT update whitelist group
+app.put("/api/whitelist-groups/:id", (req, res) => {
+  const { id } = req.params;
+  const { name, description, ips } = req.body;
+
+  const idx = whitelistGroups.findIndex(g => g.id === id);
+  if (idx === -1) {
+    return res.status(404).json({ error: "未找到指定的白名单组" });
+  }
+
+  const oldIps = whitelistGroups[idx].ips;
+  const newIps = (ips !== undefined ? ips : whitelistGroups[idx].ips || "").trim();
+
+  whitelistGroups[idx] = {
+    ...whitelistGroups[idx],
+    name: (name || whitelistGroups[idx].name).trim(),
+    description: (description || whitelistGroups[idx].description || "").trim(),
+    ips: newIps,
+    updatedAt: new Date().toISOString(),
+  };
+
+  writeJsonFile(WHITELIST_GROUPS_FILE, whitelistGroups);
+
+  // 同步更新所有绑定该白名单组的规则的 allowedIps
+  if (newIps !== oldIps) {
+    let rulesUpdated = false;
+    rules.forEach(rule => {
+      if (rule.whitelistGroupId === id) {
+        rule.allowedIps = newIps;
+        rule.updatedAt = new Date().toISOString();
+        rulesUpdated = true;
+      }
+    });
+    if (rulesUpdated) {
+      writeJsonFile(RULES_FILE, rules);
+      broadcastWS("update:rules", rules);
+    }
+  }
+
+  res.json({ success: true });
+});
+
+// DELETE whitelist group
+app.delete("/api/whitelist-groups/:id", (req, res) => {
+  const { id } = req.params;
+  const idx = whitelistGroups.findIndex(g => g.id === id);
+  if (idx === -1) {
+    return res.status(404).json({ error: "未找到指定的白名单组" });
+  }
+
+  whitelistGroups.splice(idx, 1);
+  writeJsonFile(WHITELIST_GROUPS_FILE, whitelistGroups);
+  res.json({ success: true });
+});
+
 // 从命令行参数读取登录凭证
 const uArgIndex = process.argv.indexOf("-u");
 const pArgIndex = process.argv.indexOf("-p");
@@ -392,7 +495,7 @@ app.get("/api/rules", (req, res) => {
 
 // Create rule
 app.post("/api/rules", (req, res) => {
-  const { name, listenPort, targetHost, targetPort, protocol, enabled, description, allowedIps, urlSuffix } = req.body;
+  const { name, listenPort, targetHost, targetPort, protocol, enabled, description, allowedIps, whitelistGroupId, urlSuffix } = req.body;
 
   // Validate port conflict
   const conflict = rules.find(r => r.listenPort === Number(listenPort) && r.enabled);
@@ -410,6 +513,7 @@ app.post("/api/rules", (req, res) => {
     enabled: !!enabled,
     description: description || "",
     allowedIps: allowedIps || "",
+    whitelistGroupId: whitelistGroupId || "",
     urlSuffix: urlSuffix || "",
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
@@ -425,7 +529,7 @@ app.post("/api/rules", (req, res) => {
 // Update rule
 app.put("/api/rules/:id", (req, res) => {
   const { id } = req.params;
-  const { name, listenPort, targetHost, targetPort, protocol, enabled, description, allowedIps, urlSuffix } = req.body;
+  const { name, listenPort, targetHost, targetPort, protocol, enabled, description, allowedIps, whitelistGroupId, urlSuffix } = req.body;
 
   const idx = rules.findIndex(r => r.id === id);
   if (idx === -1) {
@@ -449,6 +553,7 @@ app.put("/api/rules/:id", (req, res) => {
     enabled: !!enabled,
     description: description || "",
     allowedIps: allowedIps || "",
+    whitelistGroupId: whitelistGroupId || "",
     urlSuffix: urlSuffix || "",
     updatedAt: new Date().toISOString()
   };

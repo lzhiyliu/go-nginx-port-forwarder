@@ -30,16 +30,26 @@ var distFS embed.FS
 // ============================================================================
 
 type ForwardRule struct {
+	ID               string    `json:"id"`
+	Name             string    `json:"name"`
+	ListenPort       int       `json:"listenPort"`
+	TargetHost       string    `json:"targetHost"`
+	TargetPort       int       `json:"targetPort"`
+	Protocol         string    `json:"protocol"` // "TCP" | "UDP" | "HTTP" | "HTTPS"
+	Enabled          bool      `json:"enabled"`
+	Description      string    `json:"description"`
+	AllowedIPs       string    `json:"allowedIps"`        // 允许访问的 IP 限制列表
+	WhitelistGroupID string    `json:"whitelistGroupId"`  // 绑定的白名单组 ID
+	URLSuffix        string    `json:"urlSuffix"`         // URL 路径后缀，如 api/v1
+	CreatedAt        time.Time `json:"createdAt"`
+	UpdatedAt        time.Time `json:"updatedAt"`
+}
+
+type WhitelistGroup struct {
 	ID          string    `json:"id"`
 	Name        string    `json:"name"`
-	ListenPort  int       `json:"listenPort"`
-	TargetHost  string    `json:"targetHost"`
-	TargetPort  int       `json:"targetPort"`
-	Protocol    string    `json:"protocol"` // "TCP" | "UDP" | "HTTP" | "HTTPS"
-	Enabled     bool      `json:"enabled"`
 	Description string    `json:"description"`
-	AllowedIPs  string    `json:"allowedIps"`  // 允许访问的 IP 限制列表
-	URLSuffix   string    `json:"urlSuffix"`   // URL 路径后缀，如 api/v1
+	IPs         string    `json:"ips"`         // IP 列表，空格/逗号/换行分隔
 	CreatedAt   time.Time `json:"createdAt"`
 	UpdatedAt   time.Time `json:"updatedAt"`
 }
@@ -96,18 +106,20 @@ type SystemSettings struct {
 // ============================================================================
 
 var (
-	mutex        sync.Mutex
-	rules        []ForwardRule
-	logs         []AuditLog
-	versions     []ConfigVersion
-	users        []User
-	dataDir      = "./data"
-	rulesFile    = "./data/rules.json"
-	logsFile     = "./data/logs.json"
-	versionsFile = "./data/versions.json"
-	usersFile    = "./data/users.json"
-	settingsFile = "./data/settings.json"
-	settings     SystemSettings
+	mutex              sync.Mutex
+	rules              []ForwardRule
+	logs               []AuditLog
+	versions           []ConfigVersion
+	users              []User
+	whitelistGroups    []WhitelistGroup
+	dataDir            = "./data"
+	rulesFile          = "./data/rules.json"
+	logsFile           = "./data/logs.json"
+	versionsFile       = "./data/versions.json"
+	usersFile          = "./data/users.json"
+	settingsFile       = "./data/settings.json"
+	whitelistGroupsFile = "./data/whitelist-groups.json"
+	settings           SystemSettings
 	// 命令行配置的登录凭证
 	cmdUsername string
 	cmdPassword string
@@ -132,6 +144,27 @@ func init() {
 		{ID: "u3", Username: "viewer", Role: "Viewer", DisplayName: "王开发 (仅只读观察员)", Avatar: "https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=80&fit=crop&q=80"},
 	}
 	loadOrSaveJSON(usersFile, &users, defaultUsers)
+
+	// 初始化默认白名单组
+	defaultWhitelistGroups := []WhitelistGroup{
+		{
+			ID:          "wg1",
+			Name:        "运维团队办公室",
+			Description: "公司总部运维团队办公网段",
+			IPs:         "113.89.32.229\n113.89.33.249",
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Now(),
+		},
+		{
+			ID:          "wg2",
+			Name:        "云服务器出口",
+			Description: "云端服务器公网出口 IP",
+			IPs:         "43.162.112.236",
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Now(),
+		},
+	}
+	loadOrSaveJSON(whitelistGroupsFile, &whitelistGroups, defaultWhitelistGroups)
 
 	// 初始化默认规则
 	defaultRules := []ForwardRule{
@@ -683,6 +716,8 @@ func main() {
 	http.HandleFunc("/api/ports/status", debugLogMiddleware(getPortsStatusHandler))
 	http.HandleFunc("/api/ports/check-all", debugLogMiddleware(getPortsCheckAllHandler))
 	http.HandleFunc("/api/settings", debugLogMiddleware(settingsHandler))
+	http.HandleFunc("/api/whitelist-groups", debugLogMiddleware(whitelistGroupsHandler))
+	http.HandleFunc("/api/whitelist-groups/", debugLogMiddleware(whitelistGroupDetailHandler))
 	http.HandleFunc("/api/logs", debugLogMiddleware(getLogsHandler))
 	http.HandleFunc("/api/users", debugLogMiddleware(getUsersHandler))
 	http.HandleFunc("/api/system/reset", debugLogMiddleware(postSystemResetHandler))
@@ -880,15 +915,16 @@ func rulesHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var input struct {
-			Name        string `json:"name"`
-			ListenPort  int    `json:"listenPort"`
-			TargetHost  string `json:"targetHost"`
-			TargetPort  int    `json:"targetPort"`
-			Protocol    string `json:"protocol"`
-			Enabled     bool   `json:"enabled"`
-			Description string `json:"description"`
-			AllowedIPs  string `json:"allowedIps"`
-			URLSuffix   string `json:"urlSuffix"`
+			Name             string `json:"name"`
+			ListenPort       int    `json:"listenPort"`
+			TargetHost       string `json:"targetHost"`
+			TargetPort       int    `json:"targetPort"`
+			Protocol         string `json:"protocol"`
+			Enabled          bool   `json:"enabled"`
+			Description      string `json:"description"`
+			AllowedIPs       string `json:"allowedIps"`
+			WhitelistGroupID string `json:"whitelistGroupId"`
+			URLSuffix        string `json:"urlSuffix"`
 		}
 
 		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
@@ -915,10 +951,11 @@ func rulesHandler(w http.ResponseWriter, r *http.Request) {
 			Protocol:    input.Protocol,
 			Enabled:     input.Enabled,
 			Description: input.Description,
-			AllowedIPs:  input.AllowedIPs,
-			URLSuffix:   input.URLSuffix,
-			CreatedAt:   time.Now(),
-			UpdatedAt:   time.Now(),
+			AllowedIPs:       input.AllowedIPs,
+			WhitelistGroupID: input.WhitelistGroupID,
+			URLSuffix:        input.URLSuffix,
+			CreatedAt:        time.Now(),
+			UpdatedAt:        time.Now(),
 		}
 
 		rules = append(rules, newRule)
@@ -972,15 +1009,16 @@ func ruleDetailHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var input struct {
-			Name        string `json:"name"`
-			ListenPort  int    `json:"listenPort"`
-			TargetHost  string `json:"targetHost"`
-			TargetPort  int    `json:"targetPort"`
-			Protocol    string `json:"protocol"`
-			Enabled     bool   `json:"enabled"`
-			Description string `json:"description"`
-			AllowedIPs  string `json:"allowedIps"`
-			URLSuffix   string `json:"urlSuffix"`
+			Name             string `json:"name"`
+			ListenPort       int    `json:"listenPort"`
+			TargetHost       string `json:"targetHost"`
+			TargetPort       int    `json:"targetPort"`
+			Protocol         string `json:"protocol"`
+			Enabled          bool   `json:"enabled"`
+			Description      string `json:"description"`
+			AllowedIPs       string `json:"allowedIps"`
+			WhitelistGroupID string `json:"whitelistGroupId"`
+			URLSuffix        string `json:"urlSuffix"`
 		}
 
 		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
@@ -1007,6 +1045,7 @@ func ruleDetailHandler(w http.ResponseWriter, r *http.Request) {
 		rules[idx].Enabled = input.Enabled
 		rules[idx].Description = input.Description
 		rules[idx].AllowedIPs = input.AllowedIPs
+		rules[idx].WhitelistGroupID = input.WhitelistGroupID
 		rules[idx].URLSuffix = input.URLSuffix
 		rules[idx].UpdatedAt = time.Now()
 
@@ -1418,6 +1457,145 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
 			"success":  true,
 			"settings": settings,
+		})
+		return
+	}
+
+	http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+}
+
+// Whitelist Groups - CRUD Handler (GET / POST)
+func whitelistGroupsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		mutex.Lock()
+		defer mutex.Unlock()
+		writeJSONResponse(w, http.StatusOK, whitelistGroups)
+		return
+	}
+
+	if r.Method == http.MethodPost {
+		var input struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			IPs         string `json:"ips"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			writeJSONResponse(w, http.StatusBadRequest, map[string]string{"error": "参数 JSON 解析错误"})
+			return
+		}
+
+		if strings.TrimSpace(input.Name) == "" {
+			writeJSONResponse(w, http.StatusBadRequest, map[string]string{"error": "组名称不能为空"})
+			return
+		}
+
+		mutex.Lock()
+		newGroup := WhitelistGroup{
+			ID:          fmt.Sprintf("wg_%d", time.Now().UnixNano()/1000000),
+			Name:        strings.TrimSpace(input.Name),
+			Description: strings.TrimSpace(input.Description),
+			IPs:         strings.TrimSpace(input.IPs),
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Now(),
+		}
+		whitelistGroups = append(whitelistGroups, newGroup)
+		saveJSON(whitelistGroupsFile, whitelistGroups)
+		mutex.Unlock()
+
+		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"group":   newGroup,
+		})
+		return
+	}
+
+	http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+}
+
+// Whitelist Group - Detail Handler (PUT / DELETE)
+func whitelistGroupDetailHandler(w http.ResponseWriter, r *http.Request) {
+	// 提取 ID: /api/whitelist-groups/wg_123
+	id := strings.TrimPrefix(r.URL.Path, "/api/whitelist-groups/")
+	if id == "" {
+		http.Error(w, "Missing group ID", http.StatusBadRequest)
+		return
+	}
+
+	if r.Method == http.MethodPut {
+		var input struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			IPs         string `json:"ips"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			writeJSONResponse(w, http.StatusBadRequest, map[string]string{"error": "参数 JSON 解析错误"})
+			return
+		}
+
+		mutex.Lock()
+		found := false
+		var oldIPs string
+		for i := range whitelistGroups {
+			if whitelistGroups[i].ID == id {
+				oldIPs = whitelistGroups[i].IPs
+				whitelistGroups[i].Name = strings.TrimSpace(input.Name)
+				whitelistGroups[i].Description = strings.TrimSpace(input.Description)
+				whitelistGroups[i].IPs = strings.TrimSpace(input.IPs)
+				whitelistGroups[i].UpdatedAt = time.Now()
+				saveJSON(whitelistGroupsFile, whitelistGroups)
+				found = true
+				break
+			}
+		}
+
+		// 同步更新所有绑定该白名单组的规则的 AllowedIPs
+		if found && strings.TrimSpace(input.IPs) != oldIPs {
+			rulesUpdated := false
+			for i := range rules {
+				if rules[i].WhitelistGroupID == id {
+					rules[i].AllowedIPs = strings.TrimSpace(input.IPs)
+					rules[i].UpdatedAt = time.Now()
+					rulesUpdated = true
+				}
+			}
+			if rulesUpdated {
+				saveJSON(rulesFile, rules)
+				broadcastWS("update:rules", rules)
+			}
+		}
+		mutex.Unlock()
+
+		if !found {
+			writeJSONResponse(w, http.StatusNotFound, map[string]string{"error": "未找到指定的白名单组"})
+			return
+		}
+
+		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+		})
+		return
+	}
+
+	if r.Method == http.MethodDelete {
+		mutex.Lock()
+		found := false
+		for i := range whitelistGroups {
+			if whitelistGroups[i].ID == id {
+				whitelistGroups = append(whitelistGroups[:i], whitelistGroups[i+1:]...)
+				saveJSON(whitelistGroupsFile, whitelistGroups)
+				found = true
+				break
+			}
+		}
+		mutex.Unlock()
+
+		if !found {
+			writeJSONResponse(w, http.StatusNotFound, map[string]string{"error": "未找到指定的白名单组"})
+			return
+		}
+
+		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+			"success": true,
 		})
 		return
 	}

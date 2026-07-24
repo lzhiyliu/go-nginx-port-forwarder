@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from "react";
-import { ForwardRule, ConfigVersion, SystemStatus, AppSettings } from "./types";
+import { ForwardRule, ConfigVersion, SystemStatus, AppSettings, WhitelistGroup } from "./types";
 import ForwardRulesTable from "./components/ForwardRulesTable";
 import RuleFormModal from "./components/RuleFormModal";
+import WhitelistGroupsPanel from "./components/WhitelistGroupsPanel";
 import NginxPreviewPane from "./components/NginxPreviewPane";
 
 import {
@@ -36,7 +37,7 @@ export default function App() {
   const [loginError, setLoginError] = useState("");
 
   // Main UI states
-  const [activeTab, setActiveTab] = useState<"rules" | "shell" | "settings">("rules");
+  const [activeTab, setActiveTab] = useState<"rules" | "shell" | "settings" | "whitelist">("rules");
   const [rules, setRules] = useState<ForwardRule[]>([]);
   const [versions, setVersions] = useState<ConfigVersion[]>([]);
   
@@ -44,6 +45,9 @@ export default function App() {
   const [localIp, setLocalIp] = useState("127.0.0.1");
   const [domain, setDomain] = useState("");
   const [isSavingSettings, setIsSavingSettings] = useState(false);
+
+  // Whitelist groups state
+  const [whitelistGroups, setWhitelistGroups] = useState<WhitelistGroup[]>([]);
 
   // Port statuses state
   const [portStatuses, setPortStatuses] = useState<Record<number, boolean>>({});
@@ -111,6 +115,72 @@ export default function App() {
       }
     } catch (err) {
       console.error("Error fetching settings:", err);
+    }
+  };
+
+  // Fetch whitelist groups from API
+  const fetchWhitelistGroups = async () => {
+    try {
+      const res = await fetch("/api/whitelist-groups");
+      if (res.ok) {
+        const data = await res.json();
+        setWhitelistGroups(data);
+      }
+    } catch (err) {
+      console.error("Error fetching whitelist groups:", err);
+    }
+  };
+
+  // Add whitelist group
+  const handleAddWhitelistGroup = async (group: Omit<WhitelistGroup, "id" | "createdAt" | "updatedAt">): Promise<boolean> => {
+    try {
+      const res = await fetch("/api/whitelist-groups", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(group),
+      });
+      if (res.ok) {
+        showToast("白名单组创建成功", "success");
+        fetchWhitelistGroups();
+        return true;
+      }
+    } catch (err) {
+      console.error("Error adding whitelist group:", err);
+    }
+    return false;
+  };
+
+  // Update whitelist group
+  const handleUpdateWhitelistGroup = async (id: string, group: Omit<WhitelistGroup, "id" | "createdAt" | "updatedAt">): Promise<boolean> => {
+    try {
+      const res = await fetch(`/api/whitelist-groups/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(group),
+      });
+      if (res.ok) {
+        showToast("白名单组更新成功", "success");
+        fetchWhitelistGroups();
+        // 后端已自动同步绑定规则的 IP 列表，刷新规则数据
+        fetchData();
+        return true;
+      }
+    } catch (err) {
+      console.error("Error updating whitelist group:", err);
+    }
+    return false;
+  };
+
+  // Delete whitelist group
+  const handleDeleteWhitelistGroup = async (id: string) => {
+    try {
+      const res = await fetch(`/api/whitelist-groups/${id}`, { method: "DELETE" });
+      if (res.ok) {
+        showToast("白名单组已删除", "success");
+        fetchWhitelistGroups();
+      }
+    } catch (err) {
+      console.error("Error deleting whitelist group:", err);
     }
   };
 
@@ -281,6 +351,7 @@ export default function App() {
 
     connectWS();
     fetchSettings();
+    fetchWhitelistGroups();
     fetchData();
 
     // Trigger initial port status check
@@ -747,6 +818,24 @@ export default function App() {
                 <SettingsIcon className="h-4 w-4" />
                 <span>运行参数设置</span>
               </button>
+
+              <button
+                id="sidebar-tab-whitelist"
+                onClick={() => setActiveTab("whitelist")}
+                className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-xs font-semibold cursor-pointer transition-all ${
+                  activeTab === "whitelist"
+                    ? "bg-indigo-600 text-white shadow"
+                    : "text-slate-400 hover:text-slate-200 hover:bg-slate-800/40"
+                }`}
+              >
+                <ShieldCheck className="h-4 w-4" />
+                <span>白名单组管理</span>
+                {whitelistGroups.length > 0 && (
+                  <span className="ml-auto bg-slate-800 text-slate-300 text-[10px] px-1.5 py-0.2 rounded font-mono">
+                    {whitelistGroups.length}
+                  </span>
+                )}
+              </button>
             </div>
 
             {/* Real-time System Status Dashboard widget */}
@@ -838,11 +927,13 @@ export default function App() {
                 {activeTab === "rules" && "物理转发拓扑规则管理"}
                 {activeTab === "shell" && "系统诊断特权终端窗口"}
                 {activeTab === "settings" && "本机 IP 与域名全局参数"}
+                {activeTab === "whitelist" && "白名单组管理"}
               </h2>
               <p className="text-xs text-slate-500 mt-0.5">
                 {activeTab === "rules" && "直观管理物理机 TCP、UDP 四层映射及 Nginx HTTP Web 七层代理配置。建议每次改动后热重载生效。"}
                 {activeTab === "shell" && "在网关设备中直连系统诊断终端，可实时输入标准系统命令以排查网络通信、端口占用及状态。"}
                 {activeTab === "settings" && "在此填报机房物理公网 IP 与可用映射域名。配置后，列表地址及 Nginx 配置文件均会自动套用。"}
+                {activeTab === "whitelist" && "管理可复用的 IP 白名单组，支持单个 IP 或 CIDR 网段；新建或编辑转发规则时可绑定白名单组。"}
               </p>
             </div>
 
@@ -1100,6 +1191,17 @@ export default function App() {
                 </form>
               </div>
             )}
+
+            {activeTab === "whitelist" && (
+              <div className="h-full min-h-[450px] bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden" id="whitelist-pane-container">
+                <WhitelistGroupsPanel
+                  groups={whitelistGroups}
+                  onAdd={handleAddWhitelistGroup}
+                  onUpdate={handleUpdateWhitelistGroup}
+                  onDelete={handleDeleteWhitelistGroup}
+                />
+              </div>
+            )}
           </div>
         </main>
       </div>
@@ -1112,6 +1214,7 @@ export default function App() {
         rule={editingRule}
         recommendedPorts={recommendedPorts}
         usedPorts={usedPorts}
+        whitelistGroups={whitelistGroups}
       />
 
       {/* NGINX CONFIGURATION PREVIEW DIALOG MODAL */}

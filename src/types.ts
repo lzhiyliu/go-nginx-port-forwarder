@@ -10,8 +10,18 @@ export interface ForwardRule {
   createdAt: string;
   updatedAt: string;
   allowedIps?: string;
-  isPortOpen?: boolean; // Real-time check result
-  urlSuffix?: string;   // URL 路径后缀，如 api/v1
+  whitelistGroupId?: string;  // 绑定的白名单组 ID
+  isPortOpen?: boolean;        // Real-time check result
+  urlSuffix?: string;          // URL 路径后缀，如 api/v1
+}
+
+export interface WhitelistGroup {
+  id: string;
+  name: string;
+  description: string;
+  ips: string;          // IP 列表，空格/逗号/换行分隔
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface AppSettings {

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { ForwardRule } from "../types";
+import { ForwardRule, WhitelistGroup } from "../types";
 import { X, Sparkles, HelpCircle, Check, Info } from "lucide-react";
 
 interface RuleFormModalProps {
@@ -9,6 +9,7 @@ interface RuleFormModalProps {
   rule?: ForwardRule;
   recommendedPorts: number[];
   usedPorts: number[];
+  whitelistGroups: WhitelistGroup[];
 }
 
 export default function RuleFormModal({
@@ -17,7 +18,8 @@ export default function RuleFormModal({
   onSave,
   rule,
   recommendedPorts,
-  usedPorts
+  usedPorts,
+  whitelistGroups
 }: RuleFormModalProps) {
   const [name, setName] = useState("");
   const [protocol, setProtocol] = useState<'TCP' | 'UDP' | 'HTTP' | 'HTTPS'>("HTTP");
@@ -27,8 +29,8 @@ export default function RuleFormModal({
   const [targetPort, setTargetPort] = useState<number>(3000);
   const [enabled, setEnabled] = useState(true);
   const [description, setDescription] = useState("");
-  const [allowedIps, setAllowedIps] = useState("");
   const [urlSuffix, setUrlSuffix] = useState("");
+  const [whitelistGroupId, setWhitelistGroupId] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -45,8 +47,8 @@ export default function RuleFormModal({
         setTargetPort(rule.targetPort);
         setEnabled(rule.enabled);
         setDescription(rule.description);
-        setAllowedIps(rule.allowedIps || "");
         setUrlSuffix(rule.urlSuffix || "");
+        setWhitelistGroupId(rule.whitelistGroupId || "");
       } else {
         // Create mode
         setName("");
@@ -62,8 +64,8 @@ export default function RuleFormModal({
         setTargetPort(80);
         setEnabled(true);
         setDescription("");
-        setAllowedIps("");
         setUrlSuffix("");
+        setWhitelistGroupId("");
       }
     }
   }, [isOpen, rule, recommendedPorts]);
@@ -118,8 +120,11 @@ export default function RuleFormModal({
       protocol,
       enabled,
       description,
-      allowedIps,
-      urlSuffix
+      allowedIps: whitelistGroupId
+        ? (whitelistGroups.find(g => g.id === whitelistGroupId)?.ips || "")
+        : "",
+      urlSuffix,
+      whitelistGroupId
     });
     setIsSubmitting(false);
 
@@ -308,19 +313,29 @@ export default function RuleFormModal({
             </div>
           </div>
 
-          {/* Access Control IP Whitelist */}
+          {/* Whitelist Group Binding */}
           <div>
-            <label className="block text-xs font-semibold text-slate-600 mb-1">访问 IP 限制 (可选)</label>
-            <input
-              type="text"
-              id="input-rule-allowed-ips"
-              placeholder="例如: 192.168.1.5, 10.0.0.0/24 (支持多个，用空格或逗号分隔；留空表示全部允许)"
-              className="w-full px-3 py-2 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono text-xs"
-              value={allowedIps}
-              onChange={(e) => setAllowedIps(e.target.value)}
-            />
+            <label className="block text-xs font-semibold text-slate-600 mb-1">
+              绑定白名单组
+            </label>
+            <select
+              id="input-rule-whitelist-group"
+              value={whitelistGroupId}
+              onChange={(e) => {
+                setWhitelistGroupId(e.target.value);
+              }}
+              className="w-full px-3 py-2 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm bg-white"
+            >
+              <option value="">-- 不限制（所有 IP 均可访问） --</option>
+              {whitelistGroups.map((group) => (
+                <option key={group.id} value={group.id}>
+                  {group.name} ({group.ips.split(/[\s,;\n]+/).filter(s => s.trim()).length} 个 IP)
+                  {group.description ? ` - ${group.description}` : ""}
+                </option>
+              ))}
+            </select>
             <p className="text-[10px] text-slate-400 mt-1">
-              默认不填写即全部 IP 均可访问。支持输入多个，支持 IP网段。多个 IP 之间使用逗号、空格、分号分隔。
+              选择白名单组后自动应用其 IP 列表；白名单组更新后绑定规则自动同步
             </p>
           </div>
 
