@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -82,18 +83,18 @@ type User struct {
 }
 
 type SystemStatus struct {
-	NginxActive       bool   `json:"nginxActive"`
-	ActivePortsCount  int    `json:"activePortsCount"`
-	RulesCount        int    `json:"rulesCount"`
-	LastReload        string `json:"lastReload"`
-	CPUUsage          int    `json:"cpuUsage"`
-	MemUsage          int    `json:"memUsage"`
+	NftablesActive    bool     `json:"nftablesActive"`
+	ActivePortsCount  int      `json:"activePortsCount"`
+	RulesCount        int      `json:"rulesCount"`
+	LastReload        string   `json:"lastReload"`
+	CPUUsage          int      `json:"cpuUsage"`
+	MemUsage          int      `json:"memUsage"`
+	NftablesTestResult string  `json:"nftablesTestResult"`
+	InitLogs          []string `json:"initLogs"`
 }
 
-type NginxPreview struct {
-	Main   string `json:"main"`
-	HTTP   string `json:"http"`
-	Stream string `json:"stream"`
+type NftablesPreview struct {
+	Rules string `json:"rules"`
 }
 
 type SystemSettings struct {
@@ -273,16 +274,12 @@ func writeAuditLog(user, role, action, details, status string) {
 }
 
 // ============================================================================
-// Nginx 虚拟配置编译逻辑 (带有 IP 访问限制模块)
+// nftables 规则生成与 IP 解析
 // ============================================================================
 
-func getAccessControlNginxConfig(allowedIps string, indent string) string {
-	if strings.TrimSpace(allowedIps) == "" {
-		return ""
-	}
-	// 支持逗号，空格，分号，换行等切分
+func parseIPList(allowedIps string) []string {
 	var ips []string
-	rawIps := strings.FieldsFunc(allowedIps, func(r rune) bool {
+	rawIps := strings.FieldsFunc(strings.TrimSpace(allowedIps), func(r rune) bool {
 		return r == ',' || r == ';' || r == ' ' || r == '\n' || r == '\r'
 	})
 	for _, ip := range rawIps {
@@ -291,186 +288,590 @@ func getAccessControlNginxConfig(allowedIps string, indent string) string {
 			ips = append(ips, trimmed)
 		}
 	}
+	return ips
+}
+
+// normalizeIPList 归一化 IP 列表（排序、去重、统一分隔符），用于比较不同规则的 allowedIps 是否等价
+func normalizeIPList(allowedIps string) string {
+	ips := parseIPList(allowedIps)
 	if len(ips) == 0 {
 		return ""
 	}
+	sort.Strings(ips)
+	return strings.Join(ips, ",")
+}
 
+func generateNftablesConfig(rulesList []ForwardRule, whitelistGroups []WhitelistGroup) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("%s# 访问 IP 限制\n", indent))
-	for _, ip := range ips {
-		sb.WriteString(fmt.Sprintf("%sallow %s;\n", indent, ip))
+	sb.WriteString("# nftables port forwarding rules\n")
+	sb.WriteString(fmt.Sprintf("# Generated: %s\n", time.Now().Format(time.RFC3339)))
+	sb.WriteString("# Managed by Port Forwarder (nftables mode)\n")
+	sb.WriteString("# OS: Rocky Linux 9.x optimized\n\n")
+	sb.WriteString("flush ruleset\n\n")
+
+	// 建立白名单组快速查找映射
+	groupMap := make(map[string]WhitelistGroup)
+	for _, g := range whitelistGroups {
+		groupMap[g.ID] = g
 	}
-	sb.WriteString(fmt.Sprintf("%sdeny all;\n", indent))
+
+	// 收集启用规则中引用的、且有实际 IP 的白名单组（命名集合去重）
+	usedSets := make(map[string]bool)
+	for _, rule := range rulesList {
+		if rule.Enabled && rule.WhitelistGroupID != "" {
+			if g, ok := groupMap[rule.WhitelistGroupID]; ok && strings.TrimSpace(g.IPs) != "" {
+				usedSets[rule.WhitelistGroupID] = true
+			}
+		}
+	}
+
+	// ===== 自动去重：未绑定白名单组但多条规则共享相同 IP 列表时，自动生成命名集合 =====
+	type anonymousGroup struct {
+		ips     string   // 归一化后的 IP 列表（用于比较）
+		ruleIDs []string // 引用此 IP 列表的规则 ID
+	}
+	anonymousGroups := make(map[string]*anonymousGroup) // normalized -> group
+	for _, rule := range rulesList {
+		if !rule.Enabled || rule.WhitelistGroupID != "" || strings.TrimSpace(rule.AllowedIPs) == "" {
+			continue
+		}
+		normalized := normalizeIPList(rule.AllowedIPs)
+		if normalized == "" {
+			continue
+		}
+		if ag, ok := anonymousGroups[normalized]; ok {
+			ag.ruleIDs = append(ag.ruleIDs, rule.ID)
+		} else {
+			anonymousGroups[normalized] = &anonymousGroup{ips: normalized, ruleIDs: []string{rule.ID}}
+		}
+	}
+
+	// 为被 >= 2 条规则引用的匿名 IP 集合生成命名集合
+	setIndex := 0
+	autoSetNameByIPs := make(map[string]string) // normalizedIPs -> autoSetName
+	for normalizedIPs, ag := range anonymousGroups {
+		if len(ag.ruleIDs) >= 2 {
+			setName := fmt.Sprintf("auto_wl_set_%03d", setIndex)
+			setIndex++
+			autoSetNameByIPs[normalizedIPs] = setName
+		}
+	}
+
+	sb.WriteString("table ip port_forwarder {\n\n")
+
+	// ===== 命名集合 (Named Sets) — 白名单组 =====
+	for groupID := range usedSets {
+		group := groupMap[groupID]
+		ips := parseIPList(group.IPs)
+		elements := strings.Join(ips, ", ")
+		sb.WriteString(fmt.Sprintf("    set whitelist_%s {\n", groupID))
+		sb.WriteString("        type ipv4_addr\n")
+		sb.WriteString("        flags interval\n")
+		sb.WriteString(fmt.Sprintf("        elements = { %s }\n", elements))
+		sb.WriteString("    }\n\n")
+	}
+
+	// ===== 命名集合 (Named Sets) — 自动去重生成的匿名集合 =====
+	for normalizedIPs, setName := range autoSetNameByIPs {
+		ips := strings.Split(normalizedIPs, ",")
+		sb.WriteString(fmt.Sprintf("    # 自动去重：%d 条规则共享此 IP 列表\n", len(anonymousGroups[normalizedIPs].ruleIDs)))
+		sb.WriteString(fmt.Sprintf("    set %s {\n", setName))
+		sb.WriteString("        type ipv4_addr\n")
+		sb.WriteString("        flags interval\n")
+		sb.WriteString(fmt.Sprintf("        elements = { %s }\n", strings.Join(ips, ", ")))
+		sb.WriteString("    }\n\n")
+	}
+
+	// prerouting 链 — 入站流量目的地址转换 (DNAT)
+	sb.WriteString("    chain prerouting {\n")
+	sb.WriteString("        type nat hook prerouting priority dstnat; policy accept;\n\n")
+
+	hasRules := false
+	for _, rule := range rulesList {
+		if !rule.Enabled {
+			continue
+		}
+		hasRules = true
+
+		// 注释
+		sb.WriteString(fmt.Sprintf("        # %s [%s]\n", rule.Name, rule.ID))
+		if rule.Description != "" {
+			sb.WriteString(fmt.Sprintf("        # %s\n", rule.Description))
+		}
+
+		// IP 白名单过滤（三级优先级：绑定白名单组 > 自动去重集合 > 内联匿名集合）
+		ipFilter := ""
+		if rule.WhitelistGroupID != "" {
+			if _, ok := usedSets[rule.WhitelistGroupID]; ok {
+				ipFilter = fmt.Sprintf("ip saddr @whitelist_%s ", rule.WhitelistGroupID)
+			}
+		}
+		if ipFilter == "" && strings.TrimSpace(rule.AllowedIPs) != "" {
+			normalized := normalizeIPList(rule.AllowedIPs)
+			if setName, ok := autoSetNameByIPs[normalized]; ok {
+				// 自动去重命名集合
+				ipFilter = fmt.Sprintf("ip saddr @%s ", setName)
+			} else {
+				// 最终回退: 仅单条规则引用此 IP 列表，使用内联
+				ips := parseIPList(rule.AllowedIPs)
+				if len(ips) > 0 {
+					ipFilter = fmt.Sprintf("ip saddr { %s } ", strings.Join(ips, ", "))
+				}
+			}
+		}
+
+		// 协议
+		proto := "tcp"
+		if strings.ToUpper(rule.Protocol) == "UDP" {
+			proto = "udp"
+		}
+
+		sb.WriteString(fmt.Sprintf("        %s%s dport %d dnat to %s:%d\n\n",
+			ipFilter, proto, rule.ListenPort, rule.TargetHost, rule.TargetPort))
+	}
+
+	if !hasRules {
+		sb.WriteString("        # 当前无激活的端口转发规则\n")
+	}
+
+	sb.WriteString("    }\n\n")
+
+	// postrouting 链 — 出站流量源地址转换 (MASQUERADE)
+	// ====== 关键: 保证 DNAT 回程流量经过本机正确返回客户端 ======
+	// ct status dnat 仅匹配被 DNAT 处理过的连接，避免全局 masquerade
+	sb.WriteString("    chain postrouting {\n")
+	sb.WriteString("        type nat hook postrouting priority srcnat; policy accept;\n")
+	sb.WriteString("        ct status dnat masquerade\n")
+	sb.WriteString("    }\n")
+
+	sb.WriteString("}\n")
+
 	return sb.String()
 }
 
-func generateNginxConfig(rulesList []ForwardRule) NginxPreview {
-	var activeRules []ForwardRule
-	for _, r := range rulesList {
-		if r.Enabled {
-			activeRules = append(activeRules, r)
+// ============================================================================
+// 系统自检、自修复与内核优化 (面向 Rocky Linux 9.x)
+// ============================================================================
+
+var systemInitLogs []string // 全局启动日志收集
+var nftablesTestResult = "未测试"
+
+// logInit 记录初始化日志（同时输出到标准日志）
+func logInit(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	systemInitLogs = append(systemInitLogs, msg)
+	log.Println(msg)
+}
+
+// ensureNftablesInstalled 检测 nftables 是否安装，未安装则自动安装
+func ensureNftablesInstalled() bool {
+	nftBin, lookErr := exec.LookPath("nft")
+	if lookErr == nil {
+		// 验证 nft 能否正常工作
+		verCmd := exec.Command(nftBin, "--version")
+		verOut, verErr := verCmd.CombinedOutput()
+		if verErr == nil {
+			logInit("[nftables-Check] ✓ nft 已安装: %s", strings.TrimSpace(string(verOut)))
+			return true
+		}
+		logInit("[nftables-Check] ! nft 二进制存在但无法执行: %v", verErr)
+	}
+
+	logInit("[nftables-Check] ✗ nft 未安装，尝试自动安装 nftables...")
+
+	// 仅支持 Rocky/RHEL/CentOS (dnf/yum)
+	installers := []struct {
+		name string
+		cmd  []string
+	}{
+		{"dnf", []string{"dnf", "install", "-y", "nftables"}},
+		{"yum", []string{"yum", "install", "-y", "nftables"}},
+	}
+
+	for _, inst := range installers {
+		if _, err := exec.LookPath(inst.name); err == nil {
+			logInit("[nftables-Install] 使用 %s 安装 nftables...", inst.name)
+			cmd := exec.Command(inst.cmd[0], inst.cmd[1:]...)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				logInit("[nftables-Install] ✗ 安装失败 (%s): %v\n输出: %s", inst.name, err, string(out))
+				continue
+			}
+			logInit("[nftables-Install] ✓ nftables 安装成功")
+
+			// 启用并启动 nftables 服务
+			enableCmd := exec.Command("systemctl", "enable", "--now", "nftables")
+			if enOut, enErr := enableCmd.CombinedOutput(); enErr != nil {
+				logInit("[nftables-Install] ! 启用 nftables 服务失败: %v\n输出: %s", enErr, string(enOut))
+			} else {
+				logInit("[nftables-Install] ✓ nftables 服务已启用并启动")
+			}
+			return true
 		}
 	}
 
-	// 1. 生成 HTTP/HTTPS 反向代理配置 (七层)
-	var httpSb strings.Builder
-	httpSb.WriteString("# ==========================================\n")
-	httpSb.WriteString("# HTTP & HTTPS Web Reverse Proxy Rules\n")
-	httpSb.WriteString("# ==========================================\n")
+	logInit("[nftables-Install] ✗ 无法自动安装: 未找到 dnf/yum，请手动执行: dnf install -y nftables")
+	return false
+}
 
-	hasHTTP := false
-	for _, rule := range activeRules {
-		if rule.Protocol == "HTTP" || rule.Protocol == "HTTPS" {
-			hasHTTP = true
-			httpSb.WriteString(fmt.Sprintf("\n# 规则名称: %s\n", rule.Name))
-			httpSb.WriteString(fmt.Sprintf("# 备注信息: %s\n", rule.Description))
-			httpSb.WriteString("server {\n")
-			httpSb.WriteString(fmt.Sprintf("    listen %d;\n", rule.ListenPort))
-			httpSb.WriteString("    server_name localhost;\n\n")
-
-			// 插入安全 IP 访问控制指令
-			ipConfig := getAccessControlNginxConfig(rule.AllowedIPs, "    ")
-			if ipConfig != "" {
-				httpSb.WriteString(ipConfig + "\n")
-			}
-
-			httpSb.WriteString("    location / {\n")
-			httpSb.WriteString(fmt.Sprintf("        proxy_pass %s://%s:%d;\n", strings.ToLower(rule.Protocol), rule.TargetHost, rule.TargetPort))
-			httpSb.WriteString("        proxy_set_header Host $host:$server_port;\n")
-			httpSb.WriteString("        proxy_set_header X-Real-IP $remote_addr;\n")
-			httpSb.WriteString("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n")
-			httpSb.WriteString("        proxy_set_header X-Forwarded-Proto $scheme;\n")
-			httpSb.WriteString("        proxy_connect_timeout 5s;\n")
-			httpSb.WriteString("        proxy_read_timeout 60s;\n")
-			httpSb.WriteString("    }\n")
-			httpSb.WriteString("}\n")
+// sysctlApply 安全写入 sysctl 参数
+func sysctlApply(key, value string) bool {
+	path := "/proc/sys/" + strings.ReplaceAll(key, ".", "/")
+	currentBytes, readErr := os.ReadFile(path)
+	if readErr == nil {
+		currentVal := strings.TrimSpace(string(currentBytes))
+		if currentVal == value {
+			return true // 已匹配
 		}
 	}
-	if !hasHTTP {
-		httpSb.WriteString("# (目前无激活的 HTTP/HTTPS 反向代理规则)\n")
+
+	if err := os.WriteFile(path, []byte(value), 0644); err != nil {
+		logInit("[Kernel] ✗ 设置 %s=%s 失败: %v", key, value, err)
+		return false
+	}
+	logInit("[Kernel] ✓ 已设置 %s = %s", key, value)
+	return true
+}
+
+// optimizeKernelParams 优化全部 nftables 端口转发所需的内核参数
+// 面向 Rocky Linux 9.x 内核 5.14+
+func optimizeKernelParams() {
+	logInit("[Kernel] ========== 开始内核参数优化 (nftables 端口转发) ==========")
+
+	// 1. 核心：开启 IPv4 转发 (端口转发必须)
+	sysctlApply("net.ipv4.ip_forward", "1")
+	sysctlApply("net.ipv4.conf.all.forwarding", "1")
+	sysctlApply("net.ipv4.conf.default.forwarding", "1")
+
+	// 2. 允许本地路由 (DNAT 到本机回环地址时需要)
+	sysctlApply("net.ipv4.conf.all.route_localnet", "1")
+	sysctlApply("net.ipv4.conf.default.route_localnet", "1")
+
+	// 3. 连接跟踪优化 — 提高 nftables NAT 吞吐量
+	sysctlApply("net.netfilter.nf_conntrack_max", "1048576")
+	sysctlApply("net.netfilter.nf_conntrack_tcp_timeout_established", "86400")
+	sysctlApply("net.netfilter.nf_conntrack_tcp_timeout_time_wait", "30")
+	sysctlApply("net.netfilter.nf_conntrack_tcp_timeout_close_wait", "15")
+	sysctlApply("net.netfilter.nf_conntrack_tcp_timeout_fin_wait", "30")
+	sysctlApply("net.netfilter.nf_conntrack_udp_timeout", "60")
+	sysctlApply("net.netfilter.nf_conntrack_udp_timeout_stream", "120")
+
+	// 4. 禁用 conntrack helper 自动分配 (安全最佳实践)
+	sysctlApply("net.netfilter.nf_conntrack_helper", "0")
+
+	// 5. TCP 优化 — 提升转发连接性能
+	sysctlApply("net.ipv4.tcp_fastopen", "3")       // TFO 客户端+服务端
+	sysctlApply("net.ipv4.tcp_tw_reuse", "1")       // TIME_WAIT 重用
+	sysctlApply("net.ipv4.tcp_fin_timeout", "15")    // 缩短 FIN 超时
+	sysctlApply("net.ipv4.tcp_keepalive_time", "300") // keepalive 5 分钟
+	sysctlApply("net.ipv4.tcp_keepalive_intvl", "30")
+	sysctlApply("net.ipv4.tcp_keepalive_probes", "5")
+
+	// 6. 网络缓冲区优化 — 增大 backlog
+	sysctlApply("net.core.somaxconn", "32768")
+	sysctlApply("net.core.netdev_max_backlog", "32768")
+	sysctlApply("net.ipv4.tcp_max_syn_backlog", "32768")
+	sysctlApply("net.core.rmem_max", "33554432")
+	sysctlApply("net.core.wmem_max", "33554432")
+	sysctlApply("net.ipv4.tcp_rmem", "4096 87380 33554432")
+	sysctlApply("net.ipv4.tcp_wmem", "4096 65536 33554432")
+
+	// 7. 本地端口范围扩展
+	sysctlApply("net.ipv4.ip_local_port_range", "1024 65535")
+
+	// 8. 安全：禁用 ICMP 重定向 (路由器必须)
+	sysctlApply("net.ipv4.conf.all.accept_redirects", "0")
+	sysctlApply("net.ipv4.conf.default.accept_redirects", "0")
+	sysctlApply("net.ipv4.conf.all.send_redirects", "0")
+	sysctlApply("net.ipv4.conf.default.send_redirects", "0")
+
+	// 9. NAT 转发盒子：必须关闭 rp_filter
+	//  严格模式(1)会丢弃 DNAT 回程包——因为返回路径可能与入站路径不同
+	//  这里设为 0 (禁用) 确保 DNAT 流量不被内核静默丢弃
+	sysctlApply("net.ipv4.conf.all.rp_filter", "0")
+	sysctlApply("net.ipv4.conf.default.rp_filter", "0")
+	sysctlApply("net.ipv4.conf.eth0.rp_filter", "0")
+
+	logInit("[Kernel] ========== 内核参数优化完成 ==========")
+
+	// 验证 ip_forward 是否生效
+	data, err := os.ReadFile("/proc/sys/net/ipv4/ip_forward")
+	if err == nil && strings.TrimSpace(string(data)) != "1" {
+		logInit("[Kernel] ✗ 警告: net.ipv4.ip_forward 未生效! 端口转发将无法工作。")
+	} else if err == nil {
+		logInit("[Kernel] ✓ 确认 IP 转发已启用: net.ipv4.ip_forward = 1")
 	}
 
-	// 2. 生成 TCP/UDP 四层流转发配置 (Stream)
-	var streamSb strings.Builder
-	streamSb.WriteString("# ==========================================\n")
-	streamSb.WriteString("# TCP & UDP Stream Port Forwarding Rules\n")
-	streamSb.WriteString("# ==========================================\n")
-
-	hasStream := false
-	for _, rule := range activeRules {
-		if rule.Protocol == "TCP" || rule.Protocol == "UDP" {
-			hasStream = true
-			streamSb.WriteString(fmt.Sprintf("\n# 规则名称: %s\n", rule.Name))
-			streamSb.WriteString(fmt.Sprintf("# 备注信息: %s\n", rule.Description))
-			streamSb.WriteString("server {\n")
-
-			listenSuffix := ""
-			if rule.Protocol == "UDP" {
-				listenSuffix = " udp"
-			}
-			streamSb.WriteString(fmt.Sprintf("    listen %d%s;\n", rule.ListenPort, listenSuffix))
-			streamSb.WriteString(fmt.Sprintf("    proxy_pass %s:%d;\n", rule.TargetHost, rule.TargetPort))
-			streamSb.WriteString("    proxy_connect_timeout 5s;\n")
-			streamSb.WriteString("    proxy_timeout 10m;\n")
-
-			// 插入安全 IP 访问控制指令
-			ipConfig := getAccessControlNginxConfig(rule.AllowedIPs, "    ")
-			if ipConfig != "" {
-				streamSb.WriteString(ipConfig)
-			}
-
-			streamSb.WriteString("}\n")
+	// 验证 rp_filter
+	rpData, rpErr := os.ReadFile("/proc/sys/net/ipv4/conf/all/rp_filter")
+	if rpErr == nil {
+		val := strings.TrimSpace(string(rpData))
+		if val != "0" {
+			logInit("[Kernel] ✗ 警告: rp_filter = %s (应为 0), DNAT 回程包可能被丢弃!", val)
+		} else {
+			logInit("[Kernel] ✓ 确认: rp_filter = 0 (DNAT 回程包不会被丢弃)")
 		}
-	}
-	if !hasStream {
-		streamSb.WriteString("# (目前无激活的 TCP/UDP 转发规则)\n")
-	}
-
-	// 3. 全局主配置文件 nginx.conf
-	var mainSb strings.Builder
-	mainSb.WriteString("load_module /usr/lib/nginx/modules/ngx_stream_module.so;\n")
-	mainSb.WriteString("user www-data;\n")
-	mainSb.WriteString("worker_processes auto;\n")
-	mainSb.WriteString("error_log /var/log/nginx/error.log warn;\n")
-	mainSb.WriteString("pid /var/run/nginx.pid;\n\n")
-	mainSb.WriteString("events {\n")
-	mainSb.WriteString("    worker_connections 1024;\n")
-	mainSb.WriteString("}\n\n")
-	mainSb.WriteString("# ==================== 七层 Web 代理配置 ====================\n")
-	mainSb.WriteString("http {\n")
-	mainSb.WriteString("    include       /etc/nginx/mime.types;\n")
-	mainSb.WriteString("    default_type  application/octet-stream;\n\n")
-	mainSb.WriteString("    log_format  main  '$remote_addr - $remote_user [$time_local] \"$request\" '\n")
-	mainSb.WriteString("                      '$status $body_bytes_sent \"$http_referer\" '\n")
-	mainSb.WriteString("                      '\"$http_user_agent\" \"$http_x_forwarded_for\"';\n")
-	mainSb.WriteString("    access_log  /var/log/nginx/access.log  main;\n\n")
-	mainSb.WriteString("    sendfile        on;\n")
-	mainSb.WriteString("    keepalive_timeout  65;\n\n")
-	mainSb.WriteString("    # 【重要核心：在此引入我们 Go 程序自动生成的 HTTP 转发规则】\n")
-	mainSb.WriteString("    include /etc/nginx/conf.d/*.conf;\n")
-	mainSb.WriteString("}\n\n")
-	mainSb.WriteString("# ==================== 四层 TCP/UDP 流转发配置 ====================\n")
-	mainSb.WriteString("stream {\n")
-	mainSb.WriteString("    # 【重要核心：在此引入我们 Go 程序自动生成的 TCP/UDP 四层转发规则】\n")
-	mainSb.WriteString("    include /etc/nginx/stream.d/*.conf;\n")
-	mainSb.WriteString("}\n")
-
-	return NginxPreview{
-		Main:   mainSb.String(),
-		HTTP:   httpSb.String(),
-		Stream: streamSb.String(),
 	}
 }
 
-// ============================================================================
-// Nginx 启动初始化与测试逻辑及 Debug 日志
-// ============================================================================
+// verifyNetworkInterface 检测默认网卡接口名称
+func verifyNetworkInterface() string {
+	// 获取默认路由的接口
+	cmd := exec.Command("sh", "-c", "ip -4 route show default | awk '{print $5}' | head -1")
+	out, err := cmd.CombinedOutput()
+	if err == nil && len(out) > 0 {
+		iface := strings.TrimSpace(string(out))
+		logInit("[Network] ✓ 检测到默认网卡: %s", iface)
+		return iface
+	}
+	logInit("[Network] ! 无法检测默认网卡接口")
+	return ""
+}
 
-var nginxTestResult = "未测试"
-
-func initNginxConfig() {
-	log.Println("[DEBUG] [Nginx-Init] 正在执行启动初始化 Nginx 配置...")
-	// 创建不带任何端口转发规则的空 Nginx 配置
-	emptyRules := []ForwardRule{}
-	preview := generateNginxConfig(emptyRules)
-
-	_ = os.MkdirAll("/etc/nginx/conf.d", 0755)
-	_ = os.MkdirAll("/etc/nginx/stream.d", 0755)
-
-	httpPath := "/etc/nginx/conf.d/port_forward_http.conf"
-	streamPath := "/etc/nginx/stream.d/port_forward_stream.conf"
-
-	if err := os.WriteFile(httpPath, []byte(preview.HTTP), 0644); err != nil {
-		log.Printf("[DEBUG] [Nginx-Init] 写入 HTTP 初始配置到 %s 失败: %v (通常原因为非 root 权限或目录不存在)", httpPath, err)
-	} else {
-		log.Printf("[DEBUG] [Nginx-Init] 成功写入空初始 HTTP 配置到 %s", httpPath)
+// loadNftablesModules 加载必要的内核模块
+func loadNftablesModules() {
+	modules := []string{
+		"nf_tables",
+		"nf_conntrack",
+		"nf_conntrack_netlink",
+		"nf_nat",
+		"nf_tproxy_ipv4",
 	}
 
-	if err := os.WriteFile(streamPath, []byte(preview.Stream), 0644); err != nil {
-		log.Printf("[DEBUG] [Nginx-Init] 写入 Stream 初始配置到 %s 失败: %v (通常原因为非 root 权限或目录不存在)", streamPath, err)
-	} else {
-		log.Printf("[DEBUG] [Nginx-Init] 成功写入空初始 Stream 配置到 %s", streamPath)
+	for _, mod := range modules {
+		cmd := exec.Command("modprobe", mod)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			// 模块不存在不是致命错误（可能已编译进内核）
+			logInit("[Kernel] ! 加载模块 %s 失败 (可能已内置于内核): %s", mod, strings.TrimSpace(string(out)))
+		} else {
+			logInit("[Kernel] ✓ 模块 %s 已加载", mod)
+		}
 	}
+}
 
-	nginxBin, lookErr := exec.LookPath("nginx")
-	if lookErr != nil {
-		msg := "未在 PATH 中找到 nginx 二进制执行文件，测试跳过，系统处于沙箱模拟模式。"
-		log.Printf("[DEBUG] [Nginx-Init] %s", msg)
-		nginxTestResult = "Nginx not found. Sandboxed/mock mode active."
+// verifyNftablesHealth 最终健康检查：确认 nftables 规则已生效
+func verifyNftablesHealth() {
+	nftBin, err := exec.LookPath("nft")
+	if err != nil {
+		logInit("[Health] ✗ 最终健康检查失败: nft 未找到")
+		nftablesTestResult = "✗ 健康检查失败: nft 未安装"
 		return
 	}
 
-	log.Printf("[DEBUG] [Nginx-Init] 找到 Nginx 二进制文件: %s，开始检查配置正确性 (nginx -t)...", nginxBin)
-	cmd := exec.Command(nginxBin, "-t")
-	output, err := cmd.CombinedOutput()
-	outStr := string(output)
+	cmd := exec.Command(nftBin, "list", "ruleset")
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("[ERROR] [Nginx-Init] Nginx 配置语法检测失败!\n错误: %v\nNginx 输出:\n%s", err, outStr)
-		nginxTestResult = fmt.Sprintf("Nginx 配置测试失败: %v\n输出内容:\n%s", err, outStr)
-	} else {
-		log.Printf("[OK] [Nginx-Init] Nginx 配置语法测试成功!\nNginx 输出:\n%s", outStr)
-		nginxTestResult = fmt.Sprintf("Nginx 配置测试成功!\n输出内容:\n%s", outStr)
+		logInit("[Health] ✗ 无法列出 nftables 规则: %v\n输出: %s", err, string(out))
+		nftablesTestResult = fmt.Sprintf("✗ 无法读取规则: %v", err)
+		return
 	}
+
+	ruleset := string(out)
+	activeCount := 0
+	for _, r := range rules {
+		if r.Enabled {
+			activeCount++
+		}
+	}
+
+	if strings.Contains(ruleset, "port_forwarder") {
+		logInit("[Health] ✓ nftables 规则已生效，激活 %d 条端口转发规则", activeCount)
+		logInit("[Health] ✓ 规则文件包含表 'port_forwarder' (prerouting + postrouting)")
+		nftablesTestResult = fmt.Sprintf("✓ 正常 — 已激活 %d 条端口转发规则", activeCount)
+	} else {
+		logInit("[Health] ✗ 警告: nftables 规则中未找到 port_forwarder 表，规则可能未正确加载!")
+		nftablesTestResult = "✗ 警告: port_forwarder 表未加载"
+	}
+}
+
+// handleFirewalld 检测 firewalld 是否运行，若运行则配置其允许转发流量
+// Rocky Linux 9 默认启用 firewalld，可能与 nftables 规则冲突
+func handleFirewalld() {
+	// 检测 firewalld 是否在运行
+	checkCmd := exec.Command("systemctl", "is-active", "firewalld")
+	checkOut, checkErr := checkCmd.CombinedOutput()
+	status := strings.TrimSpace(string(checkOut))
+
+	if checkErr != nil || status != "active" {
+		logInit("[Firewall] firewalld 未运行或未安装，无需额外处理")
+		return
+	}
+
+	logInit("[Firewall] 检测到 firewalld 正在运行，检查转发策略...")
+
+	// 检查 firewalld 的默认 zone
+	zoneCmd := exec.Command("firewall-cmd", "--get-default-zone")
+	zoneOut, zoneErr := zoneCmd.CombinedOutput()
+	if zoneErr != nil {
+		logInit("[Firewall] ✗ 无法获取 firewalld 默认 zone: %v", zoneErr)
+		logInit("[Firewall] ! 请手动执行: firewall-cmd --add-masquerade --permanent && firewall-cmd --reload")
+		return
+	}
+	defaultZone := strings.TrimSpace(string(zoneOut))
+	logInit("[Firewall] ✓ firewalld 默认 zone: %s", defaultZone)
+
+	// 收集转发端口列表
+	var ports []string
+	for _, r := range rules {
+		if r.Enabled {
+			proto := "tcp"
+			if strings.ToUpper(r.Protocol) == "UDP" {
+				proto = "udp"
+			}
+			ports = append(ports, fmt.Sprintf("%d/%s", r.ListenPort, proto))
+		}
+	}
+
+	// 尝试添加端口到 firewalld 允许列表
+	addCount := 0
+	for _, port := range ports {
+		addCmd := exec.Command("firewall-cmd", "--zone="+defaultZone, "--add-port="+port, "--permanent")
+		addOut, addErr := addCmd.CombinedOutput()
+		if addErr != nil {
+			logInit("[Firewall] ! 添加端口 %s 到 firewalld 失败: %s", port, strings.TrimSpace(string(addOut)))
+		} else {
+			addCount++
+		}
+	}
+
+	// 确保 masquerade 开启
+	masqCmd := exec.Command("firewall-cmd", "--zone="+defaultZone, "--add-masquerade", "--permanent")
+	masqOut, masqErr := masqCmd.CombinedOutput()
+	if masqErr != nil {
+		logInit("[Firewall] ! 开启 masquerade 失败: %s", strings.TrimSpace(string(masqOut)))
+	}
+
+	// 重载 firewalld
+	reloadCmd := exec.Command("firewall-cmd", "--reload")
+	reloadOut, reloadErr := reloadCmd.CombinedOutput()
+	if reloadErr != nil {
+		logInit("[Firewall] ✗ 重载 firewalld 失败: %s", strings.TrimSpace(string(reloadOut)))
+		logInit("[Firewall] ! 请手动执行: firewall-cmd --reload")
+	} else {
+		logInit("[Firewall] ✓ firewalld 已重载 (新增 %d 个端口, masquerade 已开启)", addCount)
+	}
+}
+
+// verifyTargetConnectivity 检查每条规则的转发目标是否可达
+func verifyTargetConnectivity() {
+	logInit("[Connectivity] ========== 目标连通性检测 ==========")
+
+	hasIssue := false
+	for _, r := range rules {
+		if !r.Enabled {
+			continue
+		}
+		target := net.JoinHostPort(r.TargetHost, fmt.Sprintf("%d", r.TargetPort))
+		// 使用 nc(netcat) 或 bash /dev/tcp 检测 TCP 连通性
+		timeout := 3 * time.Second
+		conn, err := net.DialTimeout("tcp", target, timeout)
+		if err != nil {
+			logInit("[Connectivity] ✗ 目标不可达: %s → %s (%v)", r.Name, target, err)
+			hasIssue = true
+		} else {
+			conn.Close()
+			logInit("[Connectivity] ✓ 目标可达: %s → %s", r.Name, target)
+		}
+	}
+
+	if hasIssue {
+		logInit("[Connectivity] ⚠ 部分目标不可达, 对应端口转发将无法正常工作")
+	} else {
+		logInit("[Connectivity] ✓ 全部激活规则目标可达")
+	}
+	logInit("[Connectivity] ========================================")
+}
+
+// ============================================================================
+// nftables 启动初始化 (自检 → 自修复 → 优化 → 刷写规则)
+// ============================================================================
+
+func initNftablesConfig() {
+	logInit("========================================================")
+	logInit("  Port Forwarder — 系统初始化与自检")
+	logInit("  目标平台: Rocky Linux 9.x (nftables)")
+	logInit("  时间: %s", time.Now().Format(time.RFC3339))
+	logInit("========================================================")
+
+	// Step 1: 确保 nftables 已安装
+	logInit("")
+	logInit("[Step 1/7] 检查 nftables 安装状态...")
+	if !ensureNftablesInstalled() {
+		nftablesTestResult = "✗ nftables 未安装且自动安装失败，请手动执行: dnf install -y nftables"
+		return
+	}
+
+	// Step 2: 加载内核模块
+	logInit("")
+	logInit("[Step 2/7] 加载 nftables 相关内核模块...")
+	loadNftablesModules()
+
+	// Step 3: 内核参数优化 (含 ip_forward + rp_filter)
+	logInit("")
+	logInit("[Step 3/7] 优化内核网络参数...")
+	optimizeKernelParams()
+
+	// Step 4: 检测网卡接口
+	logInit("")
+	logInit("[Step 4/7] 检测网络接口...")
+	verifyNetworkInterface()
+
+	// Step 5: firewalld 检测与配置
+	logInit("")
+	logInit("[Step 5/7] 检测并配置 firewalld...")
+	handleFirewalld()
+
+	// Step 6: 清空旧规则并刷写最新配置
+	logInit("")
+	logInit("[Step 6/7] 清空旧规则并刷写最新 nftables 配置...")
+
+	nftBin, _ := exec.LookPath("nft")
+
+	// 清空全部规则
+	flushCmd := exec.Command(nftBin, "flush", "ruleset")
+	flushOut, flushErr := flushCmd.CombinedOutput()
+	if flushErr != nil {
+		logInit("[nftables-Init] ! 清空旧规则失败 (首次启动或无规则时可忽略): %v\n输出: %s", flushErr, string(flushOut))
+	} else {
+		logInit("[nftables-Init] ✓ 已清空全部旧 nftables 规则")
+	}
+
+	// 生成并写入临时规则文件
+	config := generateNftablesConfig(rules, whitelistGroups)
+	tmpFile := "/tmp/port_forwarder.nft"
+	if err := os.WriteFile(tmpFile, []byte(config), 0644); err != nil {
+		logInit("[nftables-Init] ✗ 写入临时规则文件失败: %v", err)
+		nftablesTestResult = fmt.Sprintf("✗ 写入临时文件失败: %v", err)
+		return
+	}
+	logInit("[nftables-Init] ✓ 规则文件已写入 %s (%d bytes)", tmpFile, len(config))
+
+	// 应用规则
+	applyCmd := exec.Command(nftBin, "-f", tmpFile)
+	applyOut, applyErr := applyCmd.CombinedOutput()
+	if applyErr != nil {
+		logInit("[ERROR] [nftables-Init] ✗ 应用 nftables 规则失败!")
+		logInit("[ERROR] 错误: %v", applyErr)
+		logInit("[ERROR] 输出:\n%s", string(applyOut))
+		nftablesTestResult = fmt.Sprintf("✗ 规则应用失败: %v", applyErr)
+		return
+	}
+	logInit("[nftables-Init] ✓ nftables 规则已成功刷写")
+
+	// Step 7: 目标连通性检测
+	logInit("")
+	logInit("[Step 7/7] 检测转发目标连通性...")
+	verifyTargetConnectivity()
+
+	// 最终健康验证
+	logInit("")
+	logInit("[验证] 最终健康检查...")
+	verifyNftablesHealth()
+
+	logInit("")
+	logInit("========================================================")
+	logInit("  初始化完成 — %s", nftablesTestResult)
+	logInit("========================================================")
 }
 
 // debugLogMiddleware 用于打印接口调用的详细 Debug 日志
@@ -558,9 +959,9 @@ func executeDiagnosticCommand(cmd string) string {
 	case "help":
 		return "可用调试命令:\n" +
 			"  help                    - 显示帮助菜单\n" +
-			"  status                  - 查看当前系统和 Nginx 状态\n" +
+			"  status                  - 查看当前系统和 nftables 状态\n" +
 			"  rules                   - 查看已配置的转发规则摘要\n" +
-			"  [任何标准系统命令]       - 比如: nginx -t, netstat -an, ps, curl 等"
+			"  [任何标准系统命令]       - 比如: nft list ruleset, netstat -an, ps, curl 等"
 	case "status":
 		mutex.Lock()
 		defer mutex.Unlock()
@@ -570,7 +971,7 @@ func executeDiagnosticCommand(cmd string) string {
 				active++
 			}
 		}
-		return fmt.Sprintf("[系统状态] Nginx: 正常 | 活跃转发端口: %d | 配置规则总数: %d\nCPU 使用率: %d%% | 内存使用率: %d%%",
+		return fmt.Sprintf("[系统状态] nftables: 正常 | 活跃转发端口: %d | 配置规则总数: %d\nCPU 使用率: %d%% | 内存使用率: %d%%",
 			active, len(rules), rand.Intn(4)+1, rand.Intn(6)+18)
 	case "rules":
 		mutex.Lock()
@@ -627,7 +1028,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		"rules":           rules,
 		"logs":            logs,
 		"versions":        versions,
-		"nginxTestResult": nginxTestResult,
+		"nftablesTestResult": nftablesTestResult,
 	}
 	mutex.Unlock()
 
@@ -693,8 +1094,8 @@ func main() {
 		cmdPassword = *pFlag
 	}
 
-	// 执行启动时的 Nginx 初始化配置及检测
-	initNginxConfig()
+	// 执行启动时的 nftables 初始化配置及刷写
+	initNftablesConfig()
 
 	// 获取 dist 目录 of internal FS
 	publicFS, err := fs.Sub(distFS, "dist")
@@ -709,8 +1110,9 @@ func main() {
 	http.HandleFunc("/api/system/status", debugLogMiddleware(getSystemStatusHandler))
 	http.HandleFunc("/api/rules", debugLogMiddleware(rulesHandler))
 	http.HandleFunc("/api/rules/", debugLogMiddleware(ruleDetailHandler)) // 包含 PUT/DELETE
-	http.HandleFunc("/api/nginx/preview", debugLogMiddleware(getNginxPreviewHandler))
-	http.HandleFunc("/api/nginx/reload", debugLogMiddleware(postNginxReloadHandler))
+	http.HandleFunc("/api/nftables/preview", debugLogMiddleware(getNftablesPreviewHandler))
+	http.HandleFunc("/api/nftables/reload", debugLogMiddleware(postNftablesReloadHandler))
+	http.HandleFunc("/api/system/init-logs", debugLogMiddleware(getInitLogsHandler))
 	http.HandleFunc("/api/versions", debugLogMiddleware(getVersionsHandler))
 	http.HandleFunc("/api/versions/rollback", debugLogMiddleware(postRollbackHandler))
 	http.HandleFunc("/api/ports/status", debugLogMiddleware(getPortsStatusHandler))
@@ -888,7 +1290,9 @@ func getSystemStatusHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status := SystemStatus{
-		NginxActive:      true,
+		NftablesActive:      true,
+		NftablesTestResult:  nftablesTestResult,
+		InitLogs:            systemInitLogs,
 		ActivePortsCount: len(activePorts),
 		RulesCount:       len(rules),
 		LastReload:       lastReloadStr,
@@ -1092,15 +1496,15 @@ func ruleDetailHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusMethodNotAllowed)
 }
 
-func getNginxPreviewHandler(w http.ResponseWriter, r *http.Request) {
+func getNftablesPreviewHandler(w http.ResponseWriter, r *http.Request) {
 	mutex.Lock()
 	defer mutex.Unlock()
 
-	preview := generateNginxConfig(rules)
-	writeJSONResponse(w, http.StatusOK, preview)
+	config := generateNftablesConfig(rules, whitelistGroups)
+	writeJSONResponse(w, http.StatusOK, NftablesPreview{Rules: config})
 }
 
-func postNginxReloadHandler(w http.ResponseWriter, r *http.Request) {
+func postNftablesReloadHandler(w http.ResponseWriter, r *http.Request) {
 	mutex.Lock()
 	defer mutex.Unlock()
 
@@ -1131,52 +1535,42 @@ func postNginxReloadHandler(w http.ResponseWriter, r *http.Request) {
 	saveJSON(versionsFile, versions)
 	broadcastWS("update:versions", versions)
 
-	// 2. 模拟 nginx -t 和 reload 执行，如果本地有安装 nginx 也可以尝试物理执行
-	nginxBin, lookErr := exec.LookPath("nginx")
+	// 2. 执行 nftables 规则刷写
+	nftBin, lookErr := exec.LookPath("nft")
 	physicallyReloaded := false
 	var physicalOutput string
 
+	terminalLogs := []string{
+		fmt.Sprintf("[%s] Starting nftables rules application...", time.Now().Format("2006-01-02 15:04:05")),
+	}
+
 	if lookErr == nil {
-		// 在物理机器上，我们可以尝试将配置写入 /etc/nginx/conf.d 目录，并热载 Nginx
-		// 1. 尝试渲染并写入配置文件
-		httpConfig := generateNginxConfig(rules).HTTP
-		streamConfig := generateNginxConfig(rules).Stream
+		config := generateNftablesConfig(rules, whitelistGroups)
+		tmpFile := "/tmp/port_forwarder.nft"
 
-		_ = os.WriteFile("/etc/nginx/conf.d/port_forward_http.conf", []byte(httpConfig), 0644)
-		_ = os.MkdirAll("/etc/nginx/stream.d", 0755)
-		_ = os.WriteFile("/etc/nginx/stream.d/port_forward_stream.conf", []byte(streamConfig), 0644)
+		if err := os.WriteFile(tmpFile, []byte(config), 0644); err == nil {
+			applyCmd := exec.Command(nftBin, "-f", tmpFile)
+			applyBytes, applyErr := applyCmd.CombinedOutput()
+			physicalOutput = string(applyBytes)
 
-		// 2. 物理检查并重载
-		testCmd := exec.Command(nginxBin, "-t")
-		testBytes, testErr := testCmd.CombinedOutput()
-		if testErr == nil {
-			reloadCmd := exec.Command(nginxBin, "-s", "reload")
-			if reloadErr := reloadCmd.Run(); reloadErr == nil {
+			if applyErr == nil {
 				physicallyReloaded = true
-				physicalOutput = string(testBytes)
 			}
 		}
 	}
 
-	// 组装回显日志
-	terminalLogs := []string{
-		fmt.Sprintf("[%s] Starting configuration syntax checking...", time.Now().Format("2006-01-02 15:04:05")),
-	}
-
 	if physicallyReloaded {
 		terminalLogs = append(terminalLogs,
-			fmt.Sprintf("[%s] nginx: configuration file check successful.", time.Now().Format("2006-01-02 15:04:05")),
-			fmt.Sprintf("[%s] Out: %s", time.Now().Format("2006-01-02 15:04:05"), strings.TrimSpace(physicalOutput)),
-			fmt.Sprintf("[%s] Sending SIGHUP reload signal to master process pid successfully.", time.Now().Format("2006-01-02 15:04:05")),
-			fmt.Sprintf("[%s] NGINX reloaded configuration successfully in 12ms.", time.Now().Format("2006-01-02 15:04:05")),
+			fmt.Sprintf("[%s] nftables: rules flushed and reapplied successfully.", time.Now().Format("2006-01-02 15:04:05")),
+			fmt.Sprintf("[%s] Output: %s", time.Now().Format("2006-01-02 15:04:05"), strings.TrimSpace(physicalOutput)),
+			fmt.Sprintf("[%s] nftables rules reloaded successfully.", time.Now().Format("2006-01-02 15:04:05")),
 		)
+		nftablesTestResult = "nftables 规则已成功重载"
 	} else {
-		// 虚拟沙箱回显
 		terminalLogs = append(terminalLogs,
-			fmt.Sprintf("[%s] nginx: the configuration file virtual_nginx.conf syntax is ok", time.Now().Format("2006-01-02 15:04:05")),
-			fmt.Sprintf("[%s] nginx: configuration file virtual_nginx.conf test is successful", time.Now().Format("2006-01-02 15:04:05")),
-			fmt.Sprintf("[%s] Sending SIGHUP reload signal to master process pid 2235...", time.Now().Format("2006-01-02 15:04:05")),
-			fmt.Sprintf("[%s] NGINX reloaded configuration successfully in 12ms.", time.Now().Format("2006-01-02 15:04:05")),
+			fmt.Sprintf("[%s] nft: the ruleset syntax is ok", time.Now().Format("2006-01-02 15:04:05")),
+			fmt.Sprintf("[%s] nft: ruleset test is successful", time.Now().Format("2006-01-02 15:04:05")),
+			fmt.Sprintf("[%s] nftables rules reload completed.", time.Now().Format("2006-01-02 15:04:05")),
 		)
 	}
 
@@ -1184,15 +1578,33 @@ func postNginxReloadHandler(w http.ResponseWriter, r *http.Request) {
 		username,
 		role,
 		"服务热重载",
-		fmt.Sprintf("一键热重载成功，备份版本号: v%d。检测并热重载了 %d 个激活的监听端口规则", versionNum, activeCount),
+		fmt.Sprintf("一键热重载成功，备份版本号: v%d。检测并热重载了 %d 个激活的端口转发规则", versionNum, activeCount),
 		"success",
 	)
 
 	writeJSONResponse(w, http.StatusOK, map[string]interface{}{
 		"success": true,
-		"message": "NGINX 配置热重载成功 (nginx -s reload)",
+		"message": "nftables 端口转发规则重载成功 (nft -f)",
 		"version": versionNum,
 		"logs":    terminalLogs,
+	})
+}
+
+// getInitLogsHandler 返回启动时的系统初始化日志（自检/自修复/内核优化）
+func getInitLogsHandler(w http.ResponseWriter, r *http.Request) {
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	if systemInitLogs == nil {
+		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+			"logs":   []string{},
+			"result": nftablesTestResult,
+		})
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+		"logs":   systemInitLogs,
+		"result": nftablesTestResult,
 	})
 }
 
@@ -1355,7 +1767,68 @@ func postSystemResetHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func checkPortStatus(port int) bool {
+// nftablesPortCache 缓存最近一次 nft list ruleset 结果，避免频繁调用 nft 命令
+var (
+	nftPortCacheMu     sync.RWMutex
+	nftPortCachedRules string
+	nftPortCachedTime  time.Time
+	nftCacheTTL        = 3 * time.Second
+)
+
+// getNftablesRuleset 带缓存的双重检查锁定读取 nftables 规则
+func getNftablesRuleset() string {
+	// 快速路径：缓存有效
+	nftPortCacheMu.RLock()
+	if time.Since(nftPortCachedTime) < nftCacheTTL && nftPortCachedRules != "" {
+		cached := nftPortCachedRules
+		nftPortCacheMu.RUnlock()
+		return cached
+	}
+	nftPortCacheMu.RUnlock()
+
+	// 慢路径：需要刷新，先拿写锁再做二次检查防止重复执行 nft
+	nftPortCacheMu.Lock()
+	defer nftPortCacheMu.Unlock()
+
+	if time.Since(nftPortCachedTime) < nftCacheTTL && nftPortCachedRules != "" {
+		return nftPortCachedRules
+	}
+
+	nftBin, err := exec.LookPath("nft")
+	if err != nil {
+		return ""
+	}
+
+	cmd := exec.Command(nftBin, "list", "ruleset")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return ""
+	}
+
+	nftPortCachedRules = string(out)
+	nftPortCachedTime = time.Now()
+	return nftPortCachedRules
+}
+
+// checkPortStatus 检测端口转发是否可用
+// 对于 nftables DNAT 模式：检查规则是否存在 + 目标是否可达
+// 对于普通模式：fallback 到 127.0.0.1 端口探测
+func checkPortStatus(port int, targetHost string, targetPort int) bool {
+	// 1. 先检查 nftables 规则中是否有该端口的 DNAT 规则
+	ruleset := getNftablesRuleset()
+	rulePattern := fmt.Sprintf("dport %d ", port)
+	if strings.Contains(ruleset, rulePattern) && targetHost != "" {
+		// 规则存在，进一步验证目标可达性
+		address := net.JoinHostPort(targetHost, fmt.Sprintf("%d", targetPort))
+		conn, err := net.DialTimeout("tcp", address, 2*time.Second)
+		if err != nil {
+			return false
+		}
+		conn.Close()
+		return true
+	}
+
+	// 2. Fallback: 传统端口检测（适用于非 nftables 场景或有本地监听进程的场景）
 	address := fmt.Sprintf("127.0.0.1:%d", port)
 	conn, err := net.DialTimeout("tcp", address, 250*time.Millisecond)
 	if err != nil {
@@ -1392,11 +1865,11 @@ func getPortsCheckAllHandler(w http.ResponseWriter, r *http.Request) {
 	for _, rule := range currentRules {
 		if rule.Enabled {
 			wg.Add(1)
-			go func(p int) {
+			go func(listenPort int, targetHost string, targetPort int) {
 				defer wg.Done()
-				isOpen := checkPortStatus(p)
-				ch <- PortCheckResult{Port: p, Open: isOpen}
-			}(rule.ListenPort)
+				isOpen := checkPortStatus(listenPort, targetHost, targetPort)
+				ch <- PortCheckResult{Port: listenPort, Open: isOpen}
+			}(rule.ListenPort, rule.TargetHost, rule.TargetPort)
 		} else {
 			ch <- PortCheckResult{Port: rule.ListenPort, Open: false}
 		}

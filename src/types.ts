@@ -39,11 +39,13 @@ export interface ConfigVersion {
 }
 
 export interface SystemStatus {
-  nginxActive: boolean;
+  nftablesActive: boolean;
   activePortsCount: number;
   rulesCount: number;
   lastReload: string;
   cpuUsage: number;
   memUsage: number;
+  nftablesTestResult?: string;
+  initLogs?: string[];
 }
 

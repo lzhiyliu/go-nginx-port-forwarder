@@ -1,6 +1,6 @@
-import React, { useState } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { ForwardRule } from "../types";
-import { Edit, Trash2, Search, ArrowRightLeft, Power, FileText, Copy, Check, RefreshCw, ExternalLink } from "lucide-react";
+import { Edit, Trash2, Search, ArrowRightLeft, Power, FileText, Copy, Check, RefreshCw, ExternalLink, Plus, Eye, ChevronLeft, ChevronRight } from "lucide-react";
 
 interface ForwardRulesTableProps {
   rules: ForwardRule[];
@@ -8,6 +8,8 @@ interface ForwardRulesTableProps {
   onDelete: (id: string) => void;
   onToggle: (rule: ForwardRule) => void;
   onDuplicate: (rule: ForwardRule) => void;
+  onCreateRule: () => void;
+  onShowPreview: () => void;
   currentUserRole: string;
   localIp: string;
   domain: string;
@@ -16,12 +18,16 @@ interface ForwardRulesTableProps {
   onCheckPorts: () => void;
 }
 
+const PAGE_SIZE_OPTIONS = [5, 10, 20];
+
 export default function ForwardRulesTable({
   rules,
   onEdit,
   onDelete,
   onToggle,
   onDuplicate,
+  onCreateRule,
+  onShowPreview,
   currentUserRole,
   localIp,
   domain,
@@ -33,23 +39,45 @@ export default function ForwardRulesTable({
   const [protocolFilter, setProtocolFilter] = useState<string>("ALL");
   const [statusFilter, setStatusFilter] = useState<string>("ALL");
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
 
-  const filteredRules = rules.filter((rule) => {
-    const matchesSearch =
-      rule.name.toLowerCase().includes(search.toLowerCase()) ||
-      rule.targetHost.toLowerCase().includes(search.toLowerCase()) ||
-      rule.listenPort.toString().includes(search) ||
-      rule.targetPort.toString().includes(search) ||
-      (rule.description && rule.description.toLowerCase().includes(search.toLowerCase()));
+  // Filter rules
+  const filteredRules = useMemo(() => {
+    return rules.filter((rule) => {
+      const matchesSearch =
+        rule.name.toLowerCase().includes(search.toLowerCase()) ||
+        rule.targetHost.toLowerCase().includes(search.toLowerCase()) ||
+        rule.listenPort.toString().includes(search) ||
+        rule.targetPort.toString().includes(search) ||
+        (rule.description && rule.description.toLowerCase().includes(search.toLowerCase()));
 
-    const matchesProtocol = protocolFilter === "ALL" || rule.protocol === protocolFilter;
-    const matchesStatus =
-      statusFilter === "ALL" ||
-      (statusFilter === "ENABLED" && rule.enabled) ||
-      (statusFilter === "DISABLED" && !rule.enabled);
+      const matchesProtocol = protocolFilter === "ALL" || rule.protocol === protocolFilter;
+      const matchesStatus =
+        statusFilter === "ALL" ||
+        (statusFilter === "ENABLED" && rule.enabled) ||
+        (statusFilter === "DISABLED" && !rule.enabled);
 
-    return matchesSearch && matchesProtocol && matchesStatus;
-  });
+      return matchesSearch && matchesProtocol && matchesStatus;
+    });
+  }, [rules, search, protocolFilter, statusFilter]);
+
+  // Reset page to 1 when filters or rules change
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [search, protocolFilter, statusFilter, rules.length]);
+
+  // Paginate
+  const totalPages = Math.max(1, Math.ceil(filteredRules.length / pageSize));
+  // Clamp current page if total pages shrinks
+  useEffect(() => {
+    if (currentPage > totalPages) setCurrentPage(totalPages);
+  }, [currentPage, totalPages]);
+
+  const paginatedRules = useMemo(() => {
+    const start = (currentPage - 1) * pageSize;
+    return filteredRules.slice(start, start + pageSize);
+  }, [filteredRules, currentPage, pageSize]);
 
   const fallbackCopyText = (text: string, id: string) => {
     const textArea = document.createElement("textarea");
@@ -89,8 +117,6 @@ export default function ForwardRulesTable({
     }
   };
 
-  // 构建完整入口 URL: protocol://host:port/urlSuffix
-  // 规则协议为 HTTP/HTTPS 时拼接协议头，TCP/UDP 时仅展示 IP:PORT
   const buildFullUrl = (host: string, port: number, protocol: string, suffix?: string): string => {
     const protoLower = protocol.toLowerCase();
     const prefix = (protoLower === "http" || protoLower === "https") ? `${protoLower}://` : "";
@@ -98,18 +124,21 @@ export default function ForwardRulesTable({
     return `${prefix}${host}:${port}${pathSuffix}`;
   };
 
-  // 在外部浏览器中打开链接
   const handleOpenExternal = (url: string) => {
     window.open(url, "_blank", "noopener,noreferrer");
   };
 
   const isReadOnly = currentUserRole === "Viewer";
 
+  // Pagination helpers
+  const pageStart = filteredRules.length === 0 ? 0 : (currentPage - 1) * pageSize + 1;
+  const pageEnd = Math.min(currentPage * pageSize, filteredRules.length);
+
   return (
     <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden flex flex-col h-full" id="rules-table-container">
-      {/* Table Header Filter controls */}
-      <div className="p-4 bg-slate-50 border-b border-slate-200 flex flex-col md:flex-row gap-3 items-center justify-between">
-        <div className="relative w-full md:w-80">
+      {/* Table Header Filter controls + Action buttons */}
+      <div className="p-3 sm:p-4 bg-slate-50 border-b border-slate-200 flex flex-col md:flex-row gap-3 items-center justify-between shrink-0">
+        <div className="relative w-full md:w-72">
           <Search className="absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
           <input
             type="text"
@@ -121,7 +150,7 @@ export default function ForwardRulesTable({
           />
         </div>
 
-        <div className="flex flex-wrap gap-2 w-full md:w-auto items-center">
+        <div className="flex flex-wrap gap-2 items-center">
           <select
             id="protocol-filter"
             className="px-3 py-2 border border-slate-200 rounded-lg text-sm bg-white focus:outline-none focus:ring-1 focus:ring-indigo-500"
@@ -152,14 +181,35 @@ export default function ForwardRulesTable({
             disabled={isCheckingPorts}
             className="flex items-center gap-1 px-3 py-2 border border-indigo-200 text-indigo-700 bg-indigo-50/50 hover:bg-indigo-50 rounded-lg text-sm transition-all cursor-pointer disabled:opacity-50"
           >
-            <RefreshCw className={`h-4.5 w-4.5 ${isCheckingPorts ? "animate-spin" : ""}`} />
+            <RefreshCw className={`h-4 w-4 ${isCheckingPorts ? "animate-spin" : ""}`} />
             <span>检测端口</span>
+          </button>
+
+          {/* Rule Preview & Create buttons moved from header */}
+          <button
+            id="header-preview-btn"
+            onClick={onShowPreview}
+            className="flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold rounded-lg shadow-sm transition-all cursor-pointer border border-slate-700"
+            title="查看实时编译的 nftables 规则"
+          >
+            <Eye className="h-4 w-4 text-indigo-400" />
+            <span>规则预览</span>
+          </button>
+
+          <button
+            id="header-create-btn"
+            onClick={onCreateRule}
+            className="flex items-center gap-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-lg shadow-sm transition-all cursor-pointer"
+            title="创建新转发路径"
+          >
+            <Plus className="h-4 w-4" />
+            <span>新建转发规则</span>
           </button>
         </div>
       </div>
 
-      {/* Table Data list */}
-      <div className="overflow-y-auto flex-1 min-h-[400px]">
+      {/* Table Data list - fixed height with internal scroll */}
+      <div className="overflow-y-auto flex-1 min-h-0">
         {filteredRules.length === 0 ? (
           <div className="flex flex-col items-center justify-center p-12 text-slate-400" id="empty-rules-state">
             <FileText className="h-12 w-12 text-slate-300 mb-3" />
@@ -169,17 +219,17 @@ export default function ForwardRulesTable({
         ) : (
           <table className="w-full text-left border-collapse" id="rules-data-table">
             <thead>
-              <tr className="bg-slate-50 border-b border-slate-100 text-slate-500 text-xs font-semibold uppercase tracking-wider">
-                <th className="py-3 px-4">规则名称 / 备注描述</th>
-                <th className="py-3 px-4">转发拓扑</th>
-                <th className="py-3 px-4 text-center">网络协议</th>
-                <th className="py-3 px-4 text-center">物理端口检测</th>
-                <th className="py-3 px-4 text-center">启用状态</th>
-                <th className="py-3 px-4 text-right">操作管理</th>
+              <tr className="bg-slate-50 border-b border-slate-100 text-slate-500 text-xs font-semibold uppercase tracking-wider sticky top-0 z-10">
+                <th className="py-3 px-4 bg-slate-50">规则名称 / 备注描述</th>
+                <th className="py-3 px-4 bg-slate-50">转发拓扑</th>
+                <th className="py-3 px-4 text-center bg-slate-50">网络协议</th>
+                <th className="py-3 px-4 text-center bg-slate-50">物理端口检测</th>
+                <th className="py-3 px-4 text-center bg-slate-50">启用状态</th>
+                <th className="py-3 px-4 text-right bg-slate-50">操作管理</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 text-sm">
-              {filteredRules.map((rule) => (
+              {paginatedRules.map((rule) => (
                 <tr
                   key={rule.id}
                   id={`rule-row-${rule.id}`}
@@ -366,13 +416,46 @@ export default function ForwardRulesTable({
         )}
       </div>
 
-      {/* Summary Footer */}
-      <div className="p-3 bg-slate-50 border-t border-slate-200 text-xs text-slate-500 flex justify-between items-center">
-        <span>当前显示 <b>{filteredRules.length}</b> 条转发规则（总计 {rules.length} 条）</span>
+      {/* Summary Footer with Pagination */}
+      <div className="p-3 bg-slate-50 border-t border-slate-200 text-xs text-slate-500 flex flex-col sm:flex-row items-center justify-between gap-2 shrink-0">
         <span>
-          启用中：<b>{rules.filter(r => r.enabled).length}</b> 条 | 
-          禁用中：<b>{rules.filter(r => !r.enabled).length}</b> 条
+          显示 <b>{pageStart}-{pageEnd}</b> 条，共 <b>{filteredRules.length}</b> 条规则
+          {filteredRules.length !== rules.length && `（全部 ${rules.length} 条）`}
+          {" | "}
+          启用中：<b>{rules.filter(r => r.enabled).length}</b> 条
         </span>
+        {totalPages > 1 && (
+          <div className="flex items-center gap-1.5">
+            <select
+              className="px-2 py-1 border border-slate-200 rounded text-xs bg-white focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              value={pageSize}
+              onChange={(e) => { setPageSize(Number(e.target.value)); setCurrentPage(1); }}
+            >
+              {PAGE_SIZE_OPTIONS.map(size => (
+                <option key={size} value={size}>每页 {size} 条</option>
+              ))}
+            </select>
+            <button
+              onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+              disabled={currentPage <= 1}
+              className="p-1 rounded hover:bg-slate-200 disabled:opacity-30 disabled:hover:bg-transparent transition-colors"
+              title="上一页"
+            >
+              <ChevronLeft className="h-4 w-4" />
+            </button>
+            <span className="px-2 font-medium text-slate-600 min-w-[60px] text-center">
+              {currentPage} / {totalPages}
+            </span>
+            <button
+              onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+              disabled={currentPage >= totalPages}
+              className="p-1 rounded hover:bg-slate-200 disabled:opacity-30 disabled:hover:bg-transparent transition-colors"
+              title="下一页"
+            >
+              <ChevronRight className="h-4 w-4" />
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );

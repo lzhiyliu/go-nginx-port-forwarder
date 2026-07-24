@@ -2,31 +2,23 @@ import React, { useState } from "react";
 import { ConfigVersion } from "../types";
 import { Terminal, Copy, Check, History, Undo2, ChevronRight, FileCode, Clock, ShieldCheck, AlertCircle } from "lucide-react";
 
-interface NginxPreviewPaneProps {
-  previews: { main: string; http: string; stream: string };
+interface NftablesPreviewPaneProps {
+  previews: { rules: string };
   versions: ConfigVersion[];
   onRollback: (versionId: string) => Promise<void>;
   currentUser: any;
 }
 
 type SubTab = "live" | "backups";
-type FileTab = "http" | "stream" | "main";
 
-export default function NginxPreviewPane({
+export default function NftablesPreviewPane({
   previews,
   versions,
   onRollback,
   currentUser
-}: NginxPreviewPaneProps) {
+}: NftablesPreviewPaneProps) {
   const [activeSubTab, setActiveSubTab] = useState<SubTab>("live");
-  const [activeFileTab, setActiveFileTab] = useState<FileTab>("http");
   const [copied, setCopied] = useState(false);
-
-  const getActiveCode = () => {
-    if (activeFileTab === "main") return previews.main;
-    if (activeFileTab === "http") return previews.http;
-    return previews.stream;
-  };
 
   const fallbackCopy = (text: string) => {
     const textArea = document.createElement("textarea");
@@ -48,7 +40,7 @@ export default function NginxPreviewPane({
   };
 
   const handleCopy = () => {
-    const text = getActiveCode();
+    const text = previews.rules || "";
     try {
       if (navigator.clipboard && window.isSecureContext) {
         navigator.clipboard.writeText(text)
@@ -70,14 +62,14 @@ export default function NginxPreviewPane({
   const isAdmin = currentUser?.role === "Admin";
 
   return (
-    <div className="bg-slate-900 text-slate-100 rounded-xl shadow-lg border border-slate-800 overflow-hidden flex flex-col h-full" id="nginx-preview-container">
+    <div className="bg-slate-900 text-slate-100 rounded-xl shadow-lg border border-slate-800 overflow-hidden flex flex-col h-full" id="nftables-preview-container">
       {/* Top Controller Header */}
       <div className="p-4 bg-slate-950 border-b border-slate-800/80 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shrink-0">
         <div className="flex items-center gap-2">
           <Terminal className="h-5 w-5 text-indigo-400" />
           <div>
-            <h3 className="font-bold text-sm text-slate-100">Nginx 虚拟配置文件管理</h3>
-            <p className="text-[10px] text-slate-400">实时编译预览四层/七层规则 & 版本回滚备份机制</p>
+            <h3 className="font-bold text-sm text-slate-100">nftables 规则管理</h3>
+            <p className="text-[10px] text-slate-400">实时编译预览端口转发规则 & 版本回滚备份机制</p>
           </div>
         </div>
 
@@ -92,7 +84,7 @@ export default function NginxPreviewPane({
                 : "text-slate-400 hover:text-slate-200"
             }`}
           >
-            实时配置文件
+            实时规则文件
           </button>
           <button
             id="tab-btn-backups"
@@ -116,39 +108,9 @@ export default function NginxPreviewPane({
             {/* File selection Tabs */}
             <div className="flex items-center justify-between px-4 py-2 bg-slate-950/40 border-b border-slate-800/50">
               <div className="flex items-center gap-1.5">
-                <button
-                  id="file-tab-http"
-                  onClick={() => setActiveFileTab("http")}
-                  className={`px-3 py-1.5 text-xs font-medium border-b-2 transition-all cursor-pointer ${
-                    activeFileTab === "http"
-                      ? "border-indigo-500 text-indigo-400 bg-slate-900/50"
-                      : "border-transparent text-slate-400 hover:text-slate-200"
-                  }`}
-                >
-                  http_forward.conf
-                </button>
-                <button
-                  id="file-tab-stream"
-                  onClick={() => setActiveFileTab("stream")}
-                  className={`px-3 py-1.5 text-xs font-medium border-b-2 transition-all cursor-pointer ${
-                    activeFileTab === "stream"
-                      ? "border-indigo-500 text-indigo-400 bg-slate-900/50"
-                      : "border-transparent text-slate-400 hover:text-slate-200"
-                  }`}
-                >
-                  stream_forward.conf
-                </button>
-                <button
-                  id="file-tab-main"
-                  onClick={() => setActiveFileTab("main")}
-                  className={`px-3 py-1.5 text-xs font-medium border-b-2 transition-all cursor-pointer ${
-                    activeFileTab === "main"
-                      ? "border-indigo-500 text-indigo-400 bg-slate-900/50"
-                      : "border-transparent text-slate-400 hover:text-slate-200"
-                  }`}
-                >
-                  nginx.conf (全局主配置)
-                </button>
+                <span className="px-3 py-1.5 text-xs font-medium border-b-2 border-indigo-500 text-indigo-400 bg-slate-900/50">
+                  port_forwarder.nft
+                </span>
               </div>
 
               {/* Copy action */}
@@ -158,13 +120,13 @@ export default function NginxPreviewPane({
                 className="flex items-center gap-1 text-slate-400 hover:text-white hover:bg-slate-800 p-1 px-2 rounded text-xs transition-colors cursor-pointer border border-slate-800"
               >
                 {copied ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
-                {copied ? "已复制" : "复制代码"}
+                {copied ? "已复制" : "复制规则"}
               </button>
             </div>
 
             {/* Code Block Visualizer */}
             <div className="p-4 bg-slate-950 font-mono text-xs text-indigo-300 leading-relaxed overflow-x-auto select-text flex-1">
-              <pre className="whitespace-pre">{getActiveCode()}</pre>
+              <pre className="whitespace-pre">{previews.rules || "# 暂无规则\n"}</pre>
             </div>
           </div>
         ) : (
@@ -185,7 +147,7 @@ export default function NginxPreviewPane({
               <div className="flex flex-col items-center justify-center py-16 text-slate-500">
                 <History className="h-10 w-10 text-slate-600 mb-2" />
                 <p className="text-xs">暂无自动备份版本</p>
-                <p className="text-[10px] text-slate-600 mt-1">保存规则并触发 Nginx 热重载后将自动生成备份</p>
+                <p className="text-[10px] text-slate-600 mt-1">保存规则并触发 nftables 重载后将自动生成备份</p>
               </div>
             ) : (
               <div className="space-y-2" id="versions-history-list">
@@ -242,9 +204,9 @@ export default function NginxPreviewPane({
       <div className="p-3 bg-slate-950 border-t border-slate-800 text-[10px] text-slate-400 flex flex-wrap gap-x-4 gap-y-1 justify-between items-center shrink-0">
         <div className="flex items-center gap-1">
           <FileCode className="h-3 w-3 text-slate-500" />
-          <span>编译后路径: /etc/nginx/conf.d/port_forward.conf</span>
+          <span>规则文件: /tmp/port_forwarder.nft</span>
         </div>
-        <span>语法检测: nginx -t [PASSED]</span>
+        <span>应用命令: nft -f /tmp/port_forwarder.nft</span>
       </div>
     </div>
   );

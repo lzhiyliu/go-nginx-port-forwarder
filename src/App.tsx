@@ -3,7 +3,7 @@ import { ForwardRule, ConfigVersion, SystemStatus, AppSettings, WhitelistGroup }
 import ForwardRulesTable from "./components/ForwardRulesTable";
 import RuleFormModal from "./components/RuleFormModal";
 import WhitelistGroupsPanel from "./components/WhitelistGroupsPanel";
-import NginxPreviewPane from "./components/NginxPreviewPane";
+import NftablesPreviewPane from "./components/NginxPreviewPane";
 
 import {
   ArrowRightLeft,
@@ -55,7 +55,7 @@ export default function App() {
 
   // System metrics status
   const [systemStatus, setSystemStatus] = useState<SystemStatus>({
-    nginxActive: true,
+    nftablesActive: true,
     activePortsCount: 0,
     rulesCount: 0,
     lastReload: "暂未重载",
@@ -63,7 +63,7 @@ export default function App() {
     memUsage: 19
   });
 
-  const [previews, setPreviews] = useState({ main: "", http: "", stream: "" });
+  const [previews, setPreviews] = useState<{ rules: string }>({ rules: "" });
   const [recommendedPorts, setRecommendedPorts] = useState<number[]>([]);
   const [usedPorts, setUsedPorts] = useState<number[]>([]);
 
@@ -159,10 +159,11 @@ export default function App() {
         body: JSON.stringify(group),
       });
       if (res.ok) {
-        showToast("白名单组更新成功", "success");
+        showToast("白名单组更新成功，正在自动热重载使规则生效...", "success");
         fetchWhitelistGroups();
-        // 后端已自动同步绑定规则的 IP 列表，刷新规则数据
+        // 后端已自动同步绑定规则的 IP 列表，刷新规则数据然后热重载
         fetchData();
+        await handleHotReload(true);
         return true;
       }
     } catch (err) {
@@ -176,8 +177,11 @@ export default function App() {
     try {
       const res = await fetch(`/api/whitelist-groups/${id}`, { method: "DELETE" });
       if (res.ok) {
-        showToast("白名单组已删除", "success");
+        showToast("白名单组已删除，正在自动热重载使变更生效...", "success");
         fetchWhitelistGroups();
+        // 删除组后绑定规则的 allowedIps 仍保留，但命名集合被移除，规则需重载
+        fetchData();
+        await handleHotReload(true);
       }
     } catch (err) {
       console.error("Error deleting whitelist group:", err);
@@ -211,7 +215,7 @@ export default function App() {
         fetch("/api/versions"),
         fetch("/api/system/status"),
         fetch("/api/ports/status"),
-        fetch("/api/nginx/preview")
+        fetch("/api/nftables/preview")
       ]);
 
       if (rulesRes.ok) setRules(await rulesRes.json());
@@ -319,7 +323,7 @@ export default function App() {
             if (versions) setVersions(versions);
           } else if (message.type === "update:rules") {
             setRules(message.payload);
-            fetch("/api/nginx/preview").then(res => res.ok && res.json().then(setPreviews));
+            fetch("/api/nftables/preview").then(res => res.ok && res.json().then(setPreviews));
             fetch("/api/ports/status").then(res => res.ok && res.json().then(data => {
               setRecommendedPorts(data.recommendations);
               setUsedPorts(data.usedPorts);
@@ -435,7 +439,7 @@ export default function App() {
       if (res.ok) {
         showToast("本机 IP 与域名设置已更新并固化", "success");
         // Update live preview configurations as well
-        const prevRes = await fetch("/api/nginx/preview");
+        const prevRes = await fetch("/api/nftables/preview");
         if (prevRes.ok) setPreviews(await prevRes.json());
       } else {
         showToast("保存设置失败", "error");
@@ -465,9 +469,12 @@ export default function App() {
         return false;
       }
 
-      showToast(editingRule ? "端口配置修改成功" : "端口配置创建成功，请执行一键热重载同步", "success");
+      showToast(editingRule ? "规则修改成功，正在自动热重载使规则生效..." : "规则创建成功，正在自动热重载使规则生效...", "success");
       fetchData();
-      checkPortsStatus(); // trigger ports check
+      checkPortsStatus();
+      
+      // Auto reload nftables after save (strict validation done server-side)
+      await handleHotReload(true);
       return true;
     } catch (err: any) {
       showToast("网络请求发生错误", "error");
@@ -493,9 +500,10 @@ export default function App() {
         return;
       }
 
-      showToast("转发规则已删除，请点击一键热重载以同步 Nginx 状态", "success");
+      showToast("规则已删除，正在自动热重载使变更生效...", "success");
       fetchData();
       checkPortsStatus();
+      await handleHotReload(true);
     } catch (err) {
       showToast("删除操作失败", "error");
     }
@@ -527,9 +535,10 @@ export default function App() {
         return;
       }
 
-      showToast("复制规则副本成功，请修改配置并执行热重载", "success");
+      showToast("规则副本创建成功，正在自动热重载...", "success");
       fetchData();
       checkPortsStatus();
+      await handleHotReload(true);
     } catch (err) {
       showToast("复制操作失败", "error");
     }
@@ -553,51 +562,59 @@ export default function App() {
         return;
       }
 
-      showToast(`规则 [${rule.name}] 已${!rule.enabled ? "启用" : "禁用"}。请点击一键热重载使 Nginx 生效。`, "success");
+      showToast(`规则 [${rule.name}] 已${!rule.enabled ? "启用" : "禁用"}，正在自动热重载...`, "success");
       fetchData();
       checkPortsStatus();
+      await handleHotReload(true);
     } catch (err) {
       showToast("操作失败", "error");
     }
   };
 
-  // Trigger Nginx smooth hot reload (Hot Reload)
-  const handleHotReload = async () => {
-    setIsReloading(true);
-    setTerminalLogs([`[${new Date().toLocaleTimeString()}] 连接配置管理服务 API ...`]);
-    setIsTerminalOpen(true);
+  // Trigger nftables smooth hot reload (silent mode for auto-reload after rule changes)
+  const handleHotReload = async (silent: boolean = false) => {
+    if (!silent) {
+      setIsReloading(true);
+      setTerminalLogs([`[${new Date().toLocaleTimeString()}] 连接配置管理服务 API ...`]);
+      setIsTerminalOpen(true);
+    }
 
     try {
-      const res = await fetch("/api/nginx/reload", {
+      const res = await fetch("/api/nftables/reload", {
         method: "POST",
         headers: { "Content-Type": "application/json" }
       });
 
       if (!res.ok) {
         const errData = await res.json();
-        setTerminalLogs(prev => [
-          ...prev,
-          `[${new Date().toLocaleTimeString()}] ❌ 权限错误或服务重载异常!`,
-          `[${new Date().toLocaleTimeString()}] 错误信息: ${errData.error || "物理进程加载拦截"}`
-        ]);
-        showToast(errData.error || "Nginx 服务热重载指令执行被拒", "error");
-        setIsReloading(false);
+        if (!silent) {
+          setTerminalLogs(prev => [
+            ...prev,
+            `[${new Date().toLocaleTimeString()}] ❌ 权限错误或服务重载异常!`,
+            `[${new Date().toLocaleTimeString()}] 错误信息: ${errData.error || "物理进程加载拦截"}`
+          ]);
+        }
+        showToast(errData.error || "nftables 服务热重载指令执行被拒", "error");
         return;
       }
 
       const data = await res.json();
-      setTerminalLogs(prev => [...prev, ...data.logs]);
-      showToast(`Nginx 服务配置热重载成功，备份版本号 v${data.version}`, "success");
+      if (!silent) {
+        setTerminalLogs(prev => [...prev, ...data.logs]);
+      }
+      showToast(`nftables 规则热重载成功，备份版本号 v${data.version}`, "success");
       fetchData();
       checkPortsStatus();
     } catch (err: any) {
-      setTerminalLogs(prev => [
-        ...prev,
-        `[${new Date().toLocaleTimeString()}] ❌ 网络通讯故障，重载请求未送达。`
-      ]);
+      if (!silent) {
+        setTerminalLogs(prev => [
+          ...prev,
+          `[${new Date().toLocaleTimeString()}] ❌ 网络通讯故障，重载请求未送达。`
+        ]);
+      }
       showToast("热重载通讯失败", "error");
     } finally {
-      setIsReloading(false);
+      if (!silent) setIsReloading(false);
     }
   };
 
@@ -664,8 +681,8 @@ export default function App() {
             <div className="inline-flex p-3.5 bg-indigo-600/15 rounded-2xl border border-indigo-500/20 text-indigo-400 mb-2">
               <ArrowRightLeft className="h-8 w-8" />
             </div>
-            <h2 className="text-xl font-extrabold text-white tracking-tight">Nginx Port Forwarder</h2>
-            <p className="text-xs text-slate-400">智能端口转发与反向代理集中管理安全控制台</p>
+            <h2 className="text-xl font-extrabold text-white tracking-tight">Port Forwarder</h2>
+            <p className="text-xs text-slate-400">基于 nftables 的智能端口转发集中管理安全控制台</p>
           </div>
 
           <form onSubmit={handleLogin} className="space-y-4 pt-1" id="login-form">
@@ -719,7 +736,7 @@ export default function App() {
 
   // Render Logged in Interface
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col font-sans" id="app-root-container">
+    <div className="h-screen bg-slate-50 flex flex-col font-sans overflow-hidden" id="app-root-container">
       {/* Toast Notification */}
       {toast && (
         <div
@@ -746,8 +763,8 @@ export default function App() {
             <ArrowRightLeft className="h-5 w-5" />
           </div>
           <div>
-            <h1 className="text-sm font-bold tracking-tight">Nginx Port Forwarder</h1>
-            <p className="text-[10px] text-slate-400">可视化物理端口映射与 Web 反向代理安全运维工作台</p>
+            <h1 className="text-sm font-bold tracking-tight">Port Forwarder</h1>
+            <p className="text-[10px] text-slate-400">可视化端口映射与 nftables 规则安全运维工作台</p>
           </div>
         </div>
 
@@ -875,6 +892,35 @@ export default function App() {
                   <span className="font-mono text-slate-200 font-bold">{rules.filter(r => r.enabled).length} / {rules.length} 条</span>
                 </div>
 
+                {/* nftables 健康状态 */}
+                <div className="flex justify-between items-start">
+                  <span>nftables 状态</span>
+                  <span className={`font-mono text-[10px] font-bold max-w-[140px] text-right leading-relaxed ${systemStatus.nftablesTestResult?.startsWith("✓") ? "text-emerald-400" : "text-amber-400"}`}>
+                    {systemStatus.nftablesTestResult || "检测中..."}
+                  </span>
+                </div>
+
+                {/* 初始化日志折叠区 */}
+                {systemStatus.initLogs && systemStatus.initLogs.length > 0 && (
+                  <details className="text-[9px] text-slate-500 border-t border-slate-800/60 pt-1.5 mt-1">
+                    <summary className="cursor-pointer hover:text-slate-300 transition-colors font-bold">
+                      启动初始化日志 ({systemStatus.initLogs.filter(l => l.includes("✗") || l.includes("ERROR")).length} 条问题)
+                    </summary>
+                    <div className="mt-1 max-h-[180px] overflow-y-auto space-y-0.5 font-mono text-[8px] leading-relaxed p-1.5 bg-slate-900 rounded border border-slate-800/60">
+                      {systemStatus.initLogs.map((log, i) => {
+                        const isError = log.includes("✗") || log.includes("ERROR");
+                        const isWarn = log.includes("!") || log.includes("警告");
+                        const isOk = log.includes("✓") || log.includes("OK");
+                        let colorClass = "text-slate-400";
+                        if (isError) colorClass = "text-red-400";
+                        else if (isWarn) colorClass = "text-amber-400";
+                        else if (isOk) colorClass = "text-emerald-400";
+                        return <div key={i} className={colorClass}>{log}</div>;
+                      })}
+                    </div>
+                  </details>
+                )}
+
                 <div className="text-[9px] text-slate-500 border-t border-slate-800/60 pt-2 break-words">
                   数据同步机制:<br />
                   <span className="font-mono text-slate-400 flex items-center gap-1 mt-0.5">
@@ -919,7 +965,7 @@ export default function App() {
         </aside>
 
         {/* Main Content Pane */}
-        <main className="flex-1 overflow-y-auto p-4 lg:p-6 bg-slate-50 flex flex-col space-y-4">
+        <main className="flex-1 overflow-hidden p-4 lg:p-6 bg-slate-50 flex flex-col space-y-4 min-h-0">
           {/* Subheader Controls for Quick actions */}
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 shrink-0 bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm">
             <div>
@@ -930,75 +976,41 @@ export default function App() {
                 {activeTab === "whitelist" && "白名单组管理"}
               </h2>
               <p className="text-xs text-slate-500 mt-0.5">
-                {activeTab === "rules" && "直观管理物理机 TCP、UDP 四层映射及 Nginx HTTP Web 七层代理配置。建议每次改动后热重载生效。"}
+                {activeTab === "rules" && "直观管理物理机 TCP、UDP 四层端口映射规则。每次创建或修改规则将自动热重载生效。"}
                 {activeTab === "shell" && "在网关设备中直连系统诊断终端，可实时输入标准系统命令以排查网络通信、端口占用及状态。"}
-                {activeTab === "settings" && "在此填报机房物理公网 IP 与可用映射域名。配置后，列表地址及 Nginx 配置文件均会自动套用。"}
+                {activeTab === "settings" && "在此填报机房物理公网 IP 与可用映射域名。配置后，列表地址及 nftables 规则均会自动套用。"}
                 {activeTab === "whitelist" && "管理可复用的 IP 白名单组，支持单个 IP 或 CIDR 网段；新建或编辑转发规则时可绑定白名单组。"}
               </p>
             </div>
 
-            {/* Quick action buttons on top level header */}
-            {activeTab === "rules" && (
-              <div className="flex items-center gap-2 shrink-0">
-                <button
-                  id="header-preview-btn"
-                  onClick={() => setIsPreviewModalOpen(true)}
-                  className="flex items-center justify-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold rounded-lg shadow-sm transition-all cursor-pointer border border-slate-700"
-                  title="查看实时编译的 Nginx 配置文件"
-                >
-                  <TerminalIcon className="h-4 w-4 text-indigo-400" />
-                  <span>Nginx 预览</span>
-                </button>
 
-                <button
-                  id="header-reload-btn"
-                  onClick={handleHotReload}
-                  disabled={isReloading}
-                  className={`flex items-center justify-center gap-1.5 px-3 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white text-xs font-bold rounded-lg shadow-sm transition-all cursor-pointer`}
-                  title="使更改物理生效"
-                >
-                  <RefreshCw className={`h-4 w-4 ${isReloading ? "animate-spin" : ""}`} />
-                  <span>一键服务热重载</span>
-                </button>
-
-                <button
-                  id="header-create-btn"
-                  onClick={() => {
-                    setEditingRule(undefined);
-                    setIsFormModalOpen(true);
-                  }}
-                  className="flex items-center justify-center gap-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-lg shadow-sm transition-all cursor-pointer"
-                  title="创建新转发路径"
-                >
-                  <Plus className="h-4 w-4" />
-                  <span>新建转发规则</span>
-                </button>
-              </div>
-            )}
           </div>
 
           {/* Active component view router */}
           <div className="flex-1 min-h-0">
             {activeTab === "rules" && (
-              <div className="h-full flex flex-col items-stretch">
-                <div className="flex-1 flex flex-col h-full min-h-[450px]">
-                  <ForwardRulesTable
-                    rules={rules}
-                    onEdit={(rule) => {
-                      setEditingRule(rule);
-                      setIsFormModalOpen(true);
-                    }}
-                    onDelete={handleDeleteRule}
-                    onToggle={handleToggleRule}
-                    onDuplicate={handleDuplicateRule}
-                    currentUserRole="Admin"
-                    localIp={localIp}
-                    domain={domain}
-                    portStatuses={portStatuses}
-                    isCheckingPorts={isCheckingPorts}
-                    onCheckPorts={checkPortsStatus}
-                  />
-                </div>
+              <div className="h-full flex flex-col items-stretch min-h-0">
+                <ForwardRulesTable
+                  rules={rules}
+                  onEdit={(rule) => {
+                    setEditingRule(rule);
+                    setIsFormModalOpen(true);
+                  }}
+                  onDelete={handleDeleteRule}
+                  onToggle={handleToggleRule}
+                  onDuplicate={handleDuplicateRule}
+                  onCreateRule={() => {
+                    setEditingRule(undefined);
+                    setIsFormModalOpen(true);
+                  }}
+                  onShowPreview={() => setIsPreviewModalOpen(true)}
+                  currentUserRole="Admin"
+                  localIp={localIp}
+                  domain={domain}
+                  portStatuses={portStatuses}
+                  isCheckingPorts={isCheckingPorts}
+                  onCheckPorts={checkPortsStatus}
+                />
               </div>
             )}
 
@@ -1062,7 +1074,7 @@ export default function App() {
                           className="flex items-center gap-1.5 px-3 py-2 bg-slate-800/80 hover:bg-slate-800 border border-slate-700 text-[11px] text-slate-200 font-bold rounded-lg text-left cursor-pointer transition-colors"
                         >
                           <span className="text-indigo-400 text-xs font-mono">$</span>
-                          <span>系统与 Nginx 状态</span>
+                          <span>系统与 nftables 状态</span>
                         </button>
 
                         <button
@@ -1074,19 +1086,19 @@ export default function App() {
                         </button>
 
                         <button
-                          onClick={() => runQuickCommand("nginx -t")}
+                          onClick={() => runQuickCommand("nft list ruleset")}
                           className="flex items-center gap-1.5 px-3 py-2 bg-slate-800/80 hover:bg-slate-800 border border-slate-700 text-[11px] text-slate-200 font-bold rounded-lg text-left cursor-pointer transition-colors"
                         >
                           <span className="text-indigo-400 text-xs font-mono">$</span>
-                          <span>检测配置文件 (nginx -t)</span>
+                          <span>查看 nftables 规则 (nft list ruleset)</span>
                         </button>
 
                         <button
-                          onClick={() => runQuickCommand("ps aux | grep nginx")}
+                          onClick={() => runQuickCommand("ps aux | grep nft")}
                           className="flex items-center gap-1.5 px-3 py-2 bg-slate-800/80 hover:bg-slate-800 border border-slate-700 text-[11px] text-slate-200 font-bold rounded-lg text-left cursor-pointer transition-colors"
                         >
                           <span className="text-indigo-400 text-xs font-mono">$</span>
-                          <span>查询 nginx 运行进程</span>
+                          <span>查询 nftables 运行状态</span>
                         </button>
 
                         <button
@@ -1125,7 +1137,7 @@ export default function App() {
             )}
 
             {activeTab === "settings" && (
-              <div className="h-full min-h-[450px] bg-white rounded-2xl border border-slate-200 shadow-sm p-6 max-w-2xl" id="settings-pane-container">
+              <div className="h-full min-h-0 bg-white rounded-2xl border border-slate-200 shadow-sm p-6 max-w-2xl overflow-y-auto" id="settings-pane-container">
                 <div className="flex items-center gap-3 border-b border-slate-100 pb-4 mb-6">
                   <div className="p-2 bg-indigo-50 border border-indigo-100 rounded-lg text-indigo-600">
                     <SettingsIcon className="h-5 w-5" />
@@ -1155,7 +1167,7 @@ export default function App() {
                   <div className="space-y-2">
                     <label className="text-xs font-bold text-slate-700 block">系统映射域名 (Domain) - <span className="text-slate-400 font-normal">可选</span></label>
                     <p className="text-[11px] text-slate-400">
-                      填入本机绑定的域名（如 <span className="font-mono text-xs">ruichi.local</span>）。若留空，在规则列表以及 Nginx 全局配置中将不再显示域名入口选项。
+                      填入本机绑定的域名（如 <span className="font-mono text-xs">ruichi.local</span>）。若留空，在规则列表中不再显示域名入口选项。
                     </p>
                     <input
                       type="text"
@@ -1174,7 +1186,7 @@ export default function App() {
                     </div>
                     <ul className="list-disc pl-5 space-y-1 text-slate-500">
                       <li>端口规则拓扑中的 IP / 域名展示与复制链接</li>
-                      <li>Nginx 七层 HTTP/HTTPS 配置文件中的 <span className="font-mono text-[11px] bg-slate-100 px-1 py-0.2 rounded text-slate-700">server_name</span> 参数编译</li>
+                      <li>nftables 规则中的端口与目标地址 DNS 解析</li>
                       <li>诊断终端调试的输出摘要指标</li>
                     </ul>
                   </div>
@@ -1193,7 +1205,7 @@ export default function App() {
             )}
 
             {activeTab === "whitelist" && (
-              <div className="h-full min-h-[450px] bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden" id="whitelist-pane-container">
+              <div className="h-full min-h-0 bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden" id="whitelist-pane-container">
                 <WhitelistGroupsPanel
                   groups={whitelistGroups}
                   onAdd={handleAddWhitelistGroup}
@@ -1217,7 +1229,7 @@ export default function App() {
         whitelistGroups={whitelistGroups}
       />
 
-      {/* NGINX CONFIGURATION PREVIEW DIALOG MODAL */}
+      {/* NFTABLES CONFIGURATION PREVIEW DIALOG MODAL */}
       {isPreviewModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4 lg:p-6" id="preview-modal-overlay">
           <div className="bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl max-w-5xl w-full h-[85vh] overflow-hidden flex flex-col relative" id="preview-modal">
@@ -1231,7 +1243,7 @@ export default function App() {
             </button>
 
             <div className="flex-1 min-h-0">
-              <NginxPreviewPane
+              <NftablesPreviewPane
                 previews={previews}
                 versions={versions}
                 onRollback={handleRollback}
@@ -1251,7 +1263,7 @@ export default function App() {
               <div className="flex items-center gap-2">
                 <TerminalIcon className="h-4.5 w-4.5 text-indigo-400" />
                 <span className="text-xs font-mono font-bold text-slate-100">
-                  NGINX 物理重载终端反馈 (SIGHUP Signal)
+                  nftables 重载终端反馈
                 </span>
               </div>
               <button
@@ -1272,7 +1284,7 @@ export default function App() {
               {isReloading && (
                 <div className="flex items-center gap-1.5 text-indigo-400 animate-pulse">
                   <span>●</span>
-                  <span>正在执行 Nginx 配置重载 (nginx -t && nginx -s reload)...</span>
+                  <span>正在执行 nftables 规则重载 (nft -f)...</span>
                 </div>
               )}
             </div>
@@ -1284,7 +1296,7 @@ export default function App() {
                 type="text"
                 value={cmdInput}
                 onChange={(e) => setCmdInput(e.target.value)}
-                placeholder='输入 Nginx 调试指令 (如 "help", "status", "rules", "test", "reload", "ping")...'
+                placeholder='输入调试指令 (如 "help", "status", "rules", "nft list ruleset", "ping")...'
                 className="flex-1 bg-transparent border-0 outline-none font-mono text-xs text-slate-100 placeholder-slate-600 p-1"
               />
               <button type="submit" className="px-3 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded font-mono text-[10px] uppercase cursor-pointer">
